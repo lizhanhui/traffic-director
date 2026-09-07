@@ -764,6 +764,24 @@ async fn forward_loop(
             tokio::select! {
                 next = client.next() => match next {
                     Some(Ok((p, _))) => {
+                        // Keepalive is terminated locally: the client gets an
+                        // instant PINGRESP, and the PINGREQ is still forwarded
+                        // so the broker-side keepalive holds.
+                        match &p {
+                            MqttPacket::V3(v3::Packet::PingRequest) => {
+                                client
+                                    .send(MqttPacket::V3(v3::Packet::PingResponse))
+                                    .await
+                                    .map_err(invalid_data)?;
+                            }
+                            MqttPacket::V5(v5::Packet::PingRequest) => {
+                                client
+                                    .send(MqttPacket::V5(v5::Packet::PingResponse))
+                                    .await
+                                    .map_err(invalid_data)?;
+                            }
+                            _ => {}
+                        }
                         windows.track_c2b(&p);
                         subscriptions.track(&p);
                         if let Err(e) = b.send(p).await {
@@ -800,6 +818,10 @@ async fn forward_loop(
                         // Broker acks for outage-buffered publishes belong
                         // to the proxy; the client was already acked locally.
                         match &p {
+                            // Upstream PINGRESP: the client was already
+                            // answered locally — swallow it.
+                            MqttPacket::V3(v3::Packet::PingResponse)
+                            | MqttPacket::V5(v5::Packet::PingResponse) => {}
                             MqttPacket::V3(v3::Packet::PublishAck { packet_id })
                                 if local_acks.qos1.remove(&packet_id.get()) => {}
                             MqttPacket::V3(v3::Packet::PublishReceived { packet_id })

@@ -161,8 +161,12 @@ nothing already received is dropped.
 **Outage phase.** The client must not notice anything, so the proxy
 becomes a temporary stand-in for the broker:
 
-- **Keepalives are answered locally** (PINGREQ → PINGRESP) — otherwise the
-  client would time out and disconnect itself.
+- **Keepalives are terminated locally.** On every client PINGREQ the proxy
+  answers PINGRESP immediately and *also* forwards the PINGREQ upstream so
+  the broker-side keepalive holds; upstream PINGRESPs are swallowed since
+  the client already has its answer. The client therefore always sees an
+  instant keepalive response — even while the broker is unreachable or
+  partitioned — without the broker connection timing out.
 - **QoS1/2 publishes are acked locally and buffered** (bounded at 1 MiB,
   then the session closes rather than endangering the process). QoS0 is
   dropped, which at-most-once semantics permit.
