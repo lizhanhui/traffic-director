@@ -40,9 +40,18 @@ async fn migrate_shed_hands_sessions_to_new_process() {
 
     wait_connectable(listen).await;
 
-    // Client A connects pre-shed.
+    // Client A connects pre-shed and subscribes.
     let mut a = v3_connect(listen, "e2e-mig-a").await;
-    v3_ping(&mut a).await;
+    a.send(MqttPacket::V3(v3::Packet::Subscribe {
+        packet_id: NonZeroU16::new(9).unwrap(),
+        topic_filters: vec![("mig/route/#".into(), QoS::AtLeastOnce)],
+    }))
+    .await
+    .unwrap();
+    match next_packet(&mut a).await {
+        MqttPacket::V3(v3::Packet::SubscribeAck { .. }) => {}
+        other => panic!("expected SubscribeAck, got {other:?}"),
+    }
     let a_local_before = a.get_ref().local_addr().unwrap();
 
     // Trigger the migrate shed. The parent hands A's socket + state to the
@@ -85,6 +94,32 @@ async fn migrate_shed_hands_sessions_to_new_process() {
     // New clients connect to the child as usual.
     let mut b = v3_connect(listen, "e2e-mig-b").await;
     v3_ping(&mut b).await;
+
+    // A's subscription was restored on the child's broker connection: a
+    // publish from B routes back to A on its surviving connection.
+    let routed = Publish {
+        dup: false,
+        retain: false,
+        qos: QoS::AtLeastOnce,
+        topic: "mig/route/x".into(),
+        packet_id: NonZeroU16::new(1),
+        payload: bytes::Bytes::from_static(b"routed-after-migration"),
+        properties: None,
+    };
+    b.send(MqttPacket::V3(v3::Packet::Publish(Box::new(routed))))
+        .await
+        .unwrap();
+    match next_packet(&mut b).await {
+        MqttPacket::V3(v3::Packet::PublishAck { .. }) => {}
+        other => panic!("B expected PublishAck, got {other:?}"),
+    }
+    match next_packet(&mut a).await {
+        MqttPacket::V3(v3::Packet::Publish(p)) => {
+            assert_eq!(&p.topic[..], "mig/route/x");
+            assert_eq!(p.payload.as_ref(), b"routed-after-migration");
+        }
+        other => panic!("A expected routed Publish, got {other:?}"),
+    }
 }
 
 #[tokio::test]

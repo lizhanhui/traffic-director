@@ -25,6 +25,7 @@ use tokio_util::codec::{Decoder, Encoder, Framed, FramedParts};
 
 use crate::registry::{
     FrozenSession, ResumeAction, SessionControl, SessionRegistry, SessionSnapshot,
+    SubscriptionEntry,
 };
 use crate::window::InflightWindows;
 
@@ -41,6 +42,132 @@ pub fn codec_for(version: ProtocolVersion) -> MqttCodec {
 
 fn invalid_data(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+/// The session's active subscriptions, tracked from the packet flow and
+/// re-issued toward the broker on thaw.
+#[derive(Debug, Default)]
+pub struct Subscriptions(Vec<SubscriptionEntry>);
+
+impl Subscriptions {
+    fn upsert(&mut self, topic_filter: &str, options: u8) {
+        if let Some(entry) = self
+            .0
+            .iter_mut()
+            .find(|e| e.topic_filter == topic_filter)
+        {
+            entry.options = options; // re-subscribing replaces the options
+        } else {
+            self.0.push(SubscriptionEntry {
+                topic_filter: topic_filter.to_owned(),
+                options,
+            });
+        }
+    }
+
+    fn remove(&mut self, topic_filter: &str) {
+        self.0.retain(|e| e.topic_filter != topic_filter);
+    }
+
+    /// Track a client→broker packet.
+    fn track(&mut self, packet: &MqttPacket) {
+        match packet {
+            MqttPacket::V3(v3::Packet::Subscribe { topic_filters, .. }) => {
+                for (filter, qos) in topic_filters {
+                    self.upsert(filter, *qos as u8);
+                }
+            }
+            MqttPacket::V3(v3::Packet::Unsubscribe { topic_filters, .. }) => {
+                for filter in topic_filters {
+                    self.remove(filter);
+                }
+            }
+            MqttPacket::V5(v5::Packet::Subscribe(subscribe)) => {
+                for (filter, options) in &subscribe.topic_filters {
+                    let byte = options.qos as u8
+                        | (options.no_local as u8) << 2
+                        | (options.retain_as_published as u8) << 3
+                        | (options.retain_handling as u8) << 4;
+                    self.upsert(filter, byte);
+                }
+            }
+            MqttPacket::V5(v5::Packet::Unsubscribe(unsubscribe)) => {
+                for filter in &unsubscribe.topic_filters {
+                    self.remove(filter);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Build the re-SUBSCRIBE packet for thaw, or None if there are no
+    /// subscriptions.
+    fn resubscribe_packet(&self, version: ProtocolVersion) -> Option<MqttPacket> {
+        if self.0.is_empty() {
+            return None;
+        }
+        // Proxy-internal packet id; unrelated to any client-visible id.
+        let packet_id = std::num::NonZeroU16::new(1).unwrap();
+        let packet = match version {
+            ProtocolVersion::MQTT3 => MqttPacket::V3(v3::Packet::Subscribe {
+                packet_id,
+                topic_filters: self
+                    .0
+                    .iter()
+                    .map(|e| {
+                        let qos = rmqtt_codec::types::QoS::try_from(e.options & 0x03)
+                            .unwrap_or(rmqtt_codec::types::QoS::AtMostOnce);
+                        (e.topic_filter.clone().into(), qos)
+                    })
+                    .collect(),
+            }),
+            ProtocolVersion::MQTT5 => MqttPacket::V5(v5::Packet::Subscribe(v5::Subscribe {
+                packet_id,
+                id: None,
+                user_properties: Vec::new(),
+                topic_filters: self
+                    .0
+                    .iter()
+                    .map(|e| {
+                        let options = v5::SubscriptionOptions {
+                            qos: rmqtt_codec::types::QoS::try_from(e.options & 0x03)
+                                .unwrap_or(rmqtt_codec::types::QoS::AtMostOnce),
+                            no_local: e.options & 0x04 != 0,
+                            retain_as_published: e.options & 0x08 != 0,
+                            retain_handling: v5::RetainHandling::try_from(e.options >> 4)
+                                .unwrap_or(v5::RetainHandling::AtSubscribe),
+                        };
+                        (e.topic_filter.clone().into(), options)
+                    })
+                    .collect(),
+            })),
+        };
+        Some(packet)
+    }
+}
+
+/// Clear the clean_session (v3) / clean_start (v5) bit — bit 1 of the CONNECT
+/// flags byte — in a raw CONNECT packet, so the broker resumes the session
+/// when the child replays it.
+fn force_session_resumption(connect_raw: &mut [u8]) -> io::Result<()> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "malformed CONNECT in snapshot");
+    // Skip the fixed-header byte and the remaining-length varint.
+    let mut i = 1;
+    loop {
+        let byte = *connect_raw.get(i).ok_or_else(invalid)?;
+        i += 1;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    // Protocol name length (2 bytes) + name + protocol level (1) → flags byte.
+    let name_len = u16::from_be_bytes([
+        *connect_raw.get(i).ok_or_else(invalid)?,
+        *connect_raw.get(i + 1).ok_or_else(invalid)?,
+    ]) as usize;
+    let flags = connect_raw.get_mut(i + 2 + name_len + 1).ok_or_else(invalid)?;
+    *flags &= !0x02;
+    Ok(())
 }
 
 struct Handshake {
@@ -176,7 +303,16 @@ pub async fn run_session(
         id,
     };
 
-    forward_loop(id, client, broker, hs, control, InflightWindows::new()).await
+    forward_loop(
+        id,
+        client,
+        broker,
+        hs,
+        control,
+        InflightWindows::new(),
+        Subscriptions::default(),
+    )
+    .await
 }
 
 async fn forward_loop(
@@ -186,12 +322,14 @@ async fn forward_loop(
     hs: Handshake,
     mut control: mpsc::Receiver<SessionControl>,
     mut windows: InflightWindows,
+    mut subscriptions: Subscriptions,
 ) -> io::Result<()> {
     loop {
         tokio::select! {
             next = client.next() => match next {
                 Some(Ok((p, _))) => {
                     windows.track_c2b(&p);
+                    subscriptions.track(&p);
                     broker.send(p).await.map_err(invalid_data)?;
                 }
                 Some(Err(e)) => return Err(invalid_data(e)),
@@ -215,6 +353,7 @@ async fn forward_loop(
                         client_buf: cp.read_buf.split().to_vec(),
                         broker_buf: bp.read_buf.split().to_vec(),
                         windows: windows.snapshot(),
+                        subscriptions: subscriptions.0.clone(),
                     };
                     let mut frozen = FrozenSession {
                         id,
@@ -267,6 +406,13 @@ pub async fn adopt_session(
 ) -> io::Result<()> {
     let hs = Handshake::from_snapshot_version(snapshot.version, snapshot.connect_raw.clone())?;
 
+    // The broker must see a session *resumption*, not a fresh start: clear
+    // the clean bit in the replayed CONNECT. (v5 note: full resumption also
+    // requires the client's session_expiry > 0; the re-SUBSCRIBE below
+    // restores routing regardless.)
+    let mut connect_raw = snapshot.connect_raw.clone();
+    force_session_resumption(&mut connect_raw)?;
+
     // Adopt the client socket.
     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(client_fd) };
     std_stream.set_nonblocking(true)?;
@@ -281,7 +427,7 @@ pub async fn adopt_session(
     let mut broker = Framed::new(broker, codec_for(hs.version));
     {
         use tokio::io::AsyncWriteExt;
-        broker.get_mut().write_all(&snapshot.connect_raw).await?;
+        broker.get_mut().write_all(&connect_raw).await?;
         broker.get_mut().flush().await?;
     }
     match broker.next().await {
@@ -296,6 +442,27 @@ pub async fn adopt_session(
                 io::ErrorKind::ConnectionAborted,
                 "broker closed during CONNECT replay",
             ));
+        }
+    }
+
+    // Re-SUBSCRIBE so routing survives even when the broker dropped session
+    // state; proxy-internal, so the SUBACK is not forwarded to the client.
+    let subscriptions = Subscriptions(snapshot.subscriptions);
+    if let Some(packet) = subscriptions.resubscribe_packet(hs.version) {
+        broker.send(packet).await.map_err(invalid_data)?;
+        match broker.next().await {
+            Some(Ok((MqttPacket::V3(v3::Packet::SubscribeAck { .. }), _)))
+            | Some(Ok((MqttPacket::V5(v5::Packet::SubscribeAck(_)), _))) => {}
+            Some(Ok((other, _))) => {
+                log::warn!("re-SUBSCRIBE answered with {other:?}, continuing anyway");
+            }
+            Some(Err(e)) => return Err(invalid_data(e)),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "broker closed during re-SUBSCRIBE",
+                ));
+            }
         }
     }
 
@@ -341,5 +508,5 @@ pub async fn adopt_session(
     let (id, control) = registry.register();
     let _registration = Registration { registry, id };
 
-    forward_loop(id, client, broker, hs, control, windows).await
+    forward_loop(id, client, broker, hs, control, windows, subscriptions).await
 }

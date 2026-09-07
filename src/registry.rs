@@ -22,12 +22,22 @@ pub struct FrozenSession {
     pub client_fd: RawFd,
 }
 
+/// One subscription the client made, retained for re-SUBSCRIBE on thaw.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionEntry {
+    pub topic_filter: String,
+    /// SUBSCRIBE options byte: QoS in bits 0-1; v5 adds no_local (bit 2),
+    /// retain-as-published (bit 3), retain-handling (bits 4-5).
+    pub options: u8,
+}
+
 /// Serializable per-session state at a packet boundary.
 /// `version` is the MQTT protocol level (4 = v3.1.1, 5 = v5.0).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub version: u8,
-    /// Raw re-encoded CONNECT packet, replayed toward the broker on thaw.
+    /// Raw re-encoded CONNECT packet, replayed toward the broker on thaw
+    /// (with the clean bit cleared so the broker resumes the session).
     pub connect_raw: Vec<u8>,
     /// Undelivered bytes from the client, still frame-aligned.
     pub client_buf: Vec<u8>,
@@ -35,6 +45,8 @@ pub struct SessionSnapshot {
     pub broker_buf: Vec<u8>,
     /// QoS1/2 packets forwarded but not yet acknowledged end-to-end.
     pub windows: Vec<WindowEntry>,
+    /// Active subscriptions, re-issued toward the broker on thaw.
+    pub subscriptions: Vec<SubscriptionEntry>,
 }
 
 pub enum SessionControl {
