@@ -713,6 +713,22 @@ pub async fn run_session(
     .await
 }
 
+/// v5 server-side DISCONNECT reason codes that mean "go away, we're doing
+/// maintenance" — the proxy intercepts these and reconnects quietly. All
+/// other reasons (protocol errors, auth failures, …) are client faults and
+/// must reach the client.
+fn is_retryable_disconnect(reason: v5::DisconnectReasonCode) -> bool {
+    use v5::DisconnectReasonCode as R;
+    matches!(
+        reason,
+        R::NormalDisconnection
+            | R::ServerShuttingDown
+            | R::ServerBusy
+            | R::UseAnotherServer
+            | R::ServerMoved
+    )
+}
+
 /// What the outage phase waits on next: a connect attempt, or a backoff
 /// sleep after a failed one.
 enum OutageStep {
@@ -757,6 +773,24 @@ async fn forward_loop(
                 },
                 next = b.next() => match next {
                     Some(Ok((p, _))) => {
+                        // v5 administrative DISCONNECT (rolling update,
+                        // scale-in): swallow it and treat as a transport
+                        // loss — the client stays unaware.
+                        if let MqttPacket::V5(v5::Packet::Disconnect(d)) = &p {
+                            if is_retryable_disconnect(d.reason_code) {
+                                log::info!(
+                                    "intercepted broker DISCONNECT ({:?}), entering outage mode",
+                                    d.reason_code
+                                );
+                                broker_leftover = b.into_parts().read_buf;
+                                broker = None;
+                                continue;
+                            }
+                            // Client-fault DISCONNECT: pass it through and
+                            // end the session.
+                            client.send(p).await.map_err(invalid_data)?;
+                            return Ok(());
+                        }
                         broker = Some(b);
                         // Broker acks for outage-buffered publishes belong
                         // to the proxy; the client was already acked locally.
