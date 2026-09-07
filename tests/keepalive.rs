@@ -28,6 +28,10 @@ struct FakeBroker {
 }
 
 async fn start_fake_broker() -> FakeBroker {
+    start_fake_broker_with_ka_override(None).await
+}
+
+async fn start_fake_broker_with_ka_override(keepalive_override: Option<u16>) -> FakeBroker {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (packet_tx, packet_rx) = mpsc::channel(64);
@@ -37,7 +41,12 @@ async fn start_fake_broker() -> FakeBroker {
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
-            tokio::spawn(handle_conn(stream, packet_tx.clone(), flag.clone()));
+            tokio::spawn(handle_conn(
+                stream,
+                packet_tx.clone(),
+                flag.clone(),
+                keepalive_override,
+            ));
         }
     });
 
@@ -52,6 +61,7 @@ async fn handle_conn(
     stream: TcpStream,
     packets: mpsc::Sender<MqttPacket>,
     responsive: Arc<AtomicBool>,
+    keepalive_override: Option<u16>,
 ) {
     let mut framed = Framed::new(
         stream,
@@ -93,6 +103,7 @@ async fn handle_conn(
                     v5::Packet::ConnectAck(Box::new(v5::ConnectAck {
                         session_present: false,
                         reason_code: v5::ConnectAckReason::Success,
+                        server_keepalive_sec: keepalive_override,
                         ..Default::default()
                     })),
                 )),
@@ -353,5 +364,88 @@ async fn v5_silent_client_receives_keepalive_timeout_disconnect() {
             panic!("connection closed without KeepAliveTimeout DISCONNECT")
         }
         Err(_) => panic!("silent v5 client was not disconnected in time"),
+    }
+}
+
+/// v5: if the broker assigns a Server Keep Alive in CONNACK, the proxy must
+/// enforce THAT value for its 1.5x timeout, not the client's requested one.
+#[tokio::test]
+async fn v5_server_assigned_keepalive_overrides_enforcement() {
+    // Broker overrides keepalive to 1s regardless of what the client asked.
+    let mut broker = start_fake_broker_with_ka_override(Some(1)).await;
+    let proxy_addr = start_proxy(broker.addr).await;
+
+    let stream = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut client = Framed::new(
+        stream,
+        MqttCodec::V5(v5::Codec::new(common::MAX_PACKET, common::MAX_PACKET)),
+    );
+    client
+        .send(MqttPacket::V5(v5::Packet::Connect(Box::new(v5::Connect {
+            clean_start: true,
+            keep_alive: 60, // client asks for 60s…
+            client_id: "ka-v5-override".into(),
+            ..Default::default()
+        }))))
+        .await
+        .unwrap();
+    match common::next_packet(&mut client).await {
+        MqttPacket::V5(v5::Packet::ConnectAck(ack)) => {
+            assert_eq!(ack.reason_code, v5::ConnectAckReason::Success);
+            // …and the override passes through to the client verbatim.
+            assert_eq!(ack.server_keepalive_sec, Some(1));
+        }
+        other => panic!("expected v5 ConnectAck, got {other:?}"),
+    }
+    broker.recv().await; // CONNECT
+
+    // Client goes silent. With the override honored, the proxy must drop the
+    // connection after ~1.5s — without it, it would wait 90s.
+    match tokio::time::timeout(Duration::from_secs(6), client.next()).await {
+        Ok(Some(Ok((MqttPacket::V5(v5::Packet::Disconnect(d)), _)))) => {
+            assert_eq!(d.reason_code, v5::DisconnectReasonCode::KeepAliveTimeout);
+        }
+        Ok(Some(Ok((packet, _)))) => panic!("unexpected packet: {packet:?}"),
+        Ok(Some(Err(_))) | Ok(None) => {} // closed without DISCONNECT: enforcement ok
+        Err(_) => panic!("server-assigned keepalive was not enforced (client still held)"),
+    }
+}
+
+/// Any control packet resets the timer, not just PINGREQ.
+#[tokio::test]
+async fn any_packet_resets_keepalive_timer() {
+    let mut broker = start_fake_broker().await;
+    let proxy_addr = start_proxy(broker.addr).await;
+    let mut client = v3_connect_keepalive(proxy_addr, "ka-any", 1).await;
+    broker.recv().await; // CONNECT
+
+    // keepalive=1s; send QoS0 publishes every 500ms, never ping — the
+    // connection must survive because any packet resets the 1.5s timer.
+    for i in 0..5u16 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        client
+            .send(MqttPacket::V3(v3::Packet::Publish(Box::new(
+                rmqtt_codec::types::Publish {
+                    dup: false,
+                    retain: false,
+                    qos: QoS::AtMostOnce,
+                    topic: "ka/any".into(),
+                    packet_id: None,
+                    payload: bytes::Bytes::from(format!("n{i}")),
+                    properties: None,
+                },
+            ))))
+            .await
+            .unwrap();
+        broker.recv().await; // publish arrived upstream
+    }
+    // Sanity: connection still usable after 2.5s of non-ping activity.
+    client
+        .send(MqttPacket::V3(v3::Packet::PingRequest))
+        .await
+        .unwrap();
+    match tokio::time::timeout(INSTANT, client.next()).await {
+        Ok(Some(Ok((MqttPacket::V3(v3::Packet::PingResponse), _)))) => {}
+        other => panic!("connection died despite regular packets: {other:?}"),
     }
 }

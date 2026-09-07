@@ -372,13 +372,15 @@ async fn service_outage_packet(
 #[allow(clippy::too_many_arguments)]
 async fn establish_broker(
     broker: &mut MqttFramed,
-    hs: &Handshake,
+    version: ProtocolVersion,
+    connect_raw: &[u8],
     client: &mut MqttFramed,
     subscriptions: &Subscriptions,
     windows: &InflightWindows,
     local_acks: &mut LocalAcks,
     buffer: &mut OutageBuffer,
     broker_leftover: &mut BytesMut,
+    keep_alive: &mut u16,
 ) -> io::Result<()> {
     // CONNECT replay with forced session resumption; CONNACK stays
     // proxy-local since the client never disconnected. Note: the clean bit
@@ -387,7 +389,7 @@ async fn establish_broker(
     // non-goal"), so a client asking for expiry=0 forfeits broker-queued
     // offline messages on broker restart; routing is restored via
     // re-SUBSCRIBE regardless.
-    let mut connect_raw = hs.connect_raw.clone();
+    let mut connect_raw = connect_raw.to_vec();
     force_session_resumption(&mut connect_raw)?;
     {
         use tokio::io::AsyncWriteExt;
@@ -395,8 +397,14 @@ async fn establish_broker(
         broker.get_mut().flush().await?;
     }
     match broker.next().await {
-        Some(Ok((MqttPacket::V3(v3::Packet::ConnectAck(_)), _)))
-        | Some(Ok((MqttPacket::V5(v5::Packet::ConnectAck(_)), _))) => {}
+        Some(Ok((MqttPacket::V3(v3::Packet::ConnectAck(_)), _))) => {}
+        Some(Ok((MqttPacket::V5(v5::Packet::ConnectAck(ack)), _))) => {
+            // A Server Keep Alive assigned on a *reconnect* CONNACK also
+            // updates our enforcement timer.
+            if let Some(secs) = ack.server_keepalive_sec {
+                *keep_alive = secs;
+            }
+        }
         Some(Ok((other, _))) => {
             return Err(invalid_data(format!("broker answered CONNECT replay with {other:?}")));
         }
@@ -410,7 +418,7 @@ async fn establish_broker(
     }
 
     // Re-SUBSCRIBE; proxy-internal, so the SUBACK is not forwarded.
-    if let Some(packet) = subscriptions.resubscribe_packet(hs.version) {
+    if let Some(packet) = subscriptions.resubscribe_packet(version) {
         broker.send(packet).await.map_err(invalid_data)?;
         match broker.next().await {
             Some(Ok((MqttPacket::V3(v3::Packet::SubscribeAck { .. }), _)))
@@ -432,7 +440,7 @@ async fn establish_broker(
     // trailing partial frame can never complete and is dropped (QoS0 only —
     // QoS1/2 is healed by window retransmits / broker redelivery).
     {
-        let mut codec = codec_for(hs.version);
+        let mut codec = codec_for(version);
         loop {
             match codec.decode(broker_leftover) {
                 Ok(Some((packet, _))) => client.send(packet).await.map_err(invalid_data)?,
@@ -689,7 +697,7 @@ pub async fn run_session(
     broker_addr: SocketAddr,
     registry: Arc<SessionRegistry>,
 ) -> io::Result<()> {
-    let (mut client, hs) = match handshake(client).await {
+    let (mut client, mut hs) = match handshake(client).await {
         Ok(v) => v,
         Err(e) => return Err(e),
     };
@@ -714,6 +722,14 @@ pub async fn run_session(
             ));
         }
     };
+    // v5: if the broker assigns a Server Keep Alive in CONNACK, that value
+    // replaces the client's requested keepalive for our enforcement timer
+    // (the CONNACK is forwarded verbatim, so the client adopts it too).
+    if let MqttPacket::V5(v5::Packet::ConnectAck(ack)) = &ack
+        && let Some(secs) = ack.server_keepalive_sec
+    {
+        hs.keep_alive = secs;
+    }
     client.send(ack).await.map_err(invalid_data)?;
 
     // Only established sessions are registered (and thus migratable).
@@ -794,7 +810,7 @@ async fn forward_loop(
     mut client: MqttFramed,
     mut broker: Option<MqttFramed>,
     broker_addr: SocketAddr,
-    hs: Handshake,
+    mut hs: Handshake,
     mut control: mpsc::Receiver<SessionControl>,
     mut windows: InflightWindows,
     mut subscriptions: Subscriptions,
@@ -990,13 +1006,15 @@ async fn forward_loop(
                         let mut b = Framed::new(stream, codec_for(hs.version));
                         establish_broker(
                             &mut b,
-                            &hs,
+                            hs.version,
+                            &hs.connect_raw,
                             &mut client,
                             &subscriptions,
                             &windows,
                             &mut local_acks,
                             &mut buffer,
                             &mut broker_leftover,
+                            &mut hs.keep_alive,
                         )
                         .await?;
                         broker = Some(b);
