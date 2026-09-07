@@ -4,7 +4,8 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use rmqtt_codec::{MqttCodec, MqttPacket, v3, v5};
@@ -15,6 +16,60 @@ use tokio_util::codec::Framed;
 pub const BROKER: &str = "127.0.0.1:15883";
 pub const MAX_PACKET: u32 = 1024 * 1024;
 pub const TIMEOUT: Duration = Duration::from_secs(10);
+
+pub const BIN: &str = env!("CARGO_BIN_EXE_traffic-director");
+
+/// Kills any leftover traffic-director processes for a test's listen port,
+/// even when the test panics.
+pub struct Cleanup(pub String);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = Command::new("pkill")
+            .args(["-TERM", "-f", &format!("traffic-director {}", self.0)])
+            .status();
+    }
+}
+
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+pub fn signal(pid: u32, sig: &str) {
+    let status = Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "kill {sig} {pid} failed");
+}
+
+pub async fn wait_connectable(addr: SocketAddr) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "proxy never started listening at {addr}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+pub fn wait_exit(child: &mut Child, within: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
 
 pub fn broker_addr() -> SocketAddr {
     BROKER.parse().unwrap()

@@ -8,77 +8,24 @@
 mod common;
 
 use std::io::{BufRead, BufReader};
-use std::net::SocketAddr;
 use std::num::NonZeroU16;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{next_packet, require_broker, v3_connect, v3_ping};
+use common::{
+    BIN, Cleanup, free_port, next_packet, require_broker, signal, v3_connect, v3_ping,
+    wait_connectable, wait_exit,
+};
 use futures::SinkExt;
 use rmqtt_codec::types::{Publish, QoS};
 use rmqtt_codec::{MqttPacket, v3};
-use tokio::net::TcpStream;
-
-const BIN: &str = env!("CARGO_BIN_EXE_traffic-director");
-
-/// Kills any leftover traffic-director processes for this test's listen port,
-/// even when the test panics.
-struct Cleanup(String);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = Command::new("pkill")
-            .args(["-TERM", "-f", &format!("traffic-director {}", self.0)])
-            .status();
-    }
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-fn signal(pid: u32, sig: &str) {
-    let status = Command::new("kill")
-        .args([sig, &pid.to_string()])
-        .status()
-        .unwrap();
-    assert!(status.success(), "kill {sig} {pid} failed");
-}
-
-async fn wait_connectable(addr: SocketAddr) {
-    let deadline = Instant::now() + common::TIMEOUT;
-    loop {
-        if TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        assert!(Instant::now() < deadline, "proxy never started listening at {addr}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-fn wait_exit(child: &mut Child, within: Duration) -> Option<std::process::ExitStatus> {
-    let deadline = Instant::now() + within;
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            return Some(status);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
 
 #[tokio::test]
 async fn drain_shed_keeps_existing_sessions_and_hands_over_listener() {
     require_broker().await;
 
     let port = free_port();
-    let listen: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let listen: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let _cleanup = Cleanup(format!("--listen {listen}"));
 
     let mut parent = Command::new(BIN)

@@ -2898,7 +2898,10 @@ dependencies = [
  "foundations",
  "futures",
  "log",
+ "nix",
  "rmqtt-codec",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
 ]
