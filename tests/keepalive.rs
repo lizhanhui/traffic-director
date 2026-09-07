@@ -276,3 +276,82 @@ async fn upstream_pingresp_is_swallowed() {
         "client received a duplicate PINGRESP from upstream"
     );
 }
+
+#[tokio::test]
+async fn silent_client_is_disconnected_after_keepalive_timeout() {
+    let mut broker = start_fake_broker().await;
+    let proxy_addr = start_proxy(broker.addr).await;
+    let mut client = v3_connect_keepalive(proxy_addr, "ka-timeout", 1).await;
+    broker.recv().await; // CONNECT
+
+    // Client goes completely silent (keepalive=1s → server must drop it
+    // after 1.5s per the MQTT spec).
+    match tokio::time::timeout(Duration::from_secs(6), client.next()).await {
+        Ok(Some(Ok((packet, _)))) => panic!("unexpected packet to silent client: {packet:?}"),
+        Ok(Some(Err(_))) | Ok(None) => {} // closed: correct
+        Err(_) => panic!("silent client was not disconnected in time"),
+    }
+}
+
+#[tokio::test]
+async fn regularly_pinging_client_stays_alive() {
+    let mut broker = start_fake_broker().await;
+    let proxy_addr = start_proxy(broker.addr).await;
+    let mut client = v3_connect_keepalive(proxy_addr, "ka-regular", 1).await;
+    broker.recv().await; // CONNECT
+
+    // keepalive=1s; ping well inside the window for several cycles — the
+    // connection must survive.
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        client
+            .send(MqttPacket::V3(v3::Packet::PingRequest))
+            .await
+            .unwrap();
+        match tokio::time::timeout(INSTANT, client.next()).await {
+            Ok(Some(Ok((MqttPacket::V3(v3::Packet::PingResponse), _)))) => {}
+            other => panic!("regular client lost its connection: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn v5_silent_client_receives_keepalive_timeout_disconnect() {
+    let mut broker = start_fake_broker().await;
+    let proxy_addr = start_proxy(broker.addr).await;
+
+    let stream = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut client = Framed::new(
+        stream,
+        MqttCodec::V5(v5::Codec::new(common::MAX_PACKET, common::MAX_PACKET)),
+    );
+    client
+        .send(MqttPacket::V5(v5::Packet::Connect(Box::new(v5::Connect {
+            clean_start: true,
+            keep_alive: 1,
+            client_id: "ka-v5-timeout".into(),
+            ..Default::default()
+        }))))
+        .await
+        .unwrap();
+    match common::next_packet(&mut client).await {
+        MqttPacket::V5(v5::Packet::ConnectAck(ack)) => {
+            assert_eq!(ack.reason_code, v5::ConnectAckReason::Success);
+        }
+        other => panic!("expected v5 ConnectAck, got {other:?}"),
+    }
+    broker.recv().await; // CONNECT
+
+    // Silent: the proxy must send DISCONNECT/KeepAliveTimeout (0x8D) before
+    // closing, per the v5 spec.
+    match tokio::time::timeout(Duration::from_secs(6), client.next()).await {
+        Ok(Some(Ok((MqttPacket::V5(v5::Packet::Disconnect(d)), _)))) => {
+            assert_eq!(d.reason_code, v5::DisconnectReasonCode::KeepAliveTimeout);
+        }
+        Ok(Some(Ok((packet, _)))) => panic!("unexpected packet: {packet:?}"),
+        Ok(Some(Err(_))) | Ok(None) => {
+            panic!("connection closed without KeepAliveTimeout DISCONNECT")
+        }
+        Err(_) => panic!("silent v5 client was not disconnected in time"),
+    }
+}

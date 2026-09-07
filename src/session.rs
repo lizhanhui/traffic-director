@@ -572,6 +572,17 @@ fn force_session_resumption(connect_raw: &mut [u8]) -> io::Result<()> {
 struct Handshake {
     version: ProtocolVersion,
     connect_raw: Vec<u8>,
+    /// Client-requested keepalive in seconds (0 = disabled). Since the proxy
+    /// terminates keepalive locally, it must also enforce the 1.5× timeout.
+    keep_alive: u16,
+}
+
+fn keep_alive_of(packet: &MqttPacket) -> u16 {
+    match packet {
+        MqttPacket::V3(v3::Packet::Connect(c)) => c.keep_alive,
+        MqttPacket::V5(v5::Packet::Connect(c)) => c.keep_alive,
+        _ => 0,
+    }
 }
 
 impl Handshake {
@@ -593,8 +604,16 @@ impl Handshake {
                 ));
             }
         };
+        // Recover the keepalive by decoding the CONNECT snapshot.
+        let mut codec = codec_for(version);
+        let mut buf = BytesMut::from(&connect_raw[..]);
+        let (packet, _) = codec
+            .decode(&mut buf)
+            .map_err(invalid_data)?
+            .ok_or_else(|| invalid_data("undecodable CONNECT in snapshot"))?;
         Ok(Self {
             version,
+            keep_alive: keep_alive_of(&packet),
             connect_raw,
         })
     }
@@ -635,6 +654,7 @@ async fn handshake(client: TcpStream) -> io::Result<(MqttFramed, Handshake)> {
     };
 
     // Re-encode CONNECT so a future generation can replay it verbatim.
+    let keep_alive = keep_alive_of(&connect);
     let mut connect_raw = BytesMut::new();
     codec_for(version)
         .encode(connect, &mut connect_raw)
@@ -644,6 +664,7 @@ async fn handshake(client: TcpStream) -> io::Result<(MqttFramed, Handshake)> {
         client,
         Handshake {
             version,
+            keep_alive,
             connect_raw: connect_raw.to_vec(),
         },
     ))
@@ -734,6 +755,32 @@ fn is_retryable_disconnect(reason: v5::DisconnectReasonCode) -> bool {
     )
 }
 
+/// The instant at which a silent client must be dropped: 1.5× its
+/// keepalive after the last received packet (MQTT spec). keepalive=0
+/// disables the timeout per spec — use a far-future deadline.
+fn client_deadline(keep_alive: u16, last_activity: std::time::Instant) -> std::time::Instant {
+    if keep_alive == 0 {
+        return last_activity + std::time::Duration::from_secs(3600 * 24 * 365);
+    }
+    last_activity + std::time::Duration::from_secs(u64::from(keep_alive)) * 3 / 2
+}
+
+/// End a session for keepalive timeout. v5 clients get a DISCONNECT with
+/// reason KeepAliveTimeout (0x8D) first, per spec; v3 just closes.
+async fn close_for_keepalive(client: &mut MqttFramed, version: ProtocolVersion) {
+    if version == ProtocolVersion::MQTT5 {
+        let _ = client
+            .send(MqttPacket::V5(v5::Packet::Disconnect(v5::Disconnect {
+                reason_code: v5::DisconnectReasonCode::KeepAliveTimeout,
+                session_expiry_interval_secs: None,
+                server_reference: None,
+                reason_string: None,
+                user_properties: Vec::new(),
+            })))
+            .await;
+    }
+}
+
 /// What the outage phase waits on next: a connect attempt, or a backoff
 /// sleep after a failed one.
 enum OutageStep {
@@ -757,13 +804,16 @@ async fn forward_loop(
 ) -> io::Result<()> {
     let mut backoff = BROKER_RETRY_INITIAL;
     let mut step = OutageStep::Connect;
+    let mut last_client_activity = std::time::Instant::now();
     loop {
         if broker.is_some() {
             // ---- connected phase ----
+            let deadline = client_deadline(hs.keep_alive, last_client_activity);
             let mut b = broker.take().expect("checked above");
             tokio::select! {
                 next = client.next() => match next {
                     Some(Ok((p, _))) => {
+                        last_client_activity = std::time::Instant::now();
                         // Keepalive is terminated locally: the client gets an
                         // instant PINGRESP, and the PINGREQ is still forwarded
                         // so the broker-side keepalive holds.
@@ -892,9 +942,15 @@ async fn forward_loop(
                     }
                     None => return Ok(()),
                 },
+                _ = tokio::time::sleep_until(deadline.into()) => {
+                    log::info!("session {id}: client keepalive timeout, disconnecting");
+                    close_for_keepalive(&mut client, hs.version).await;
+                    return Ok(());
+                }
             }
         } else {
             // ---- outage phase: retry the broker while servicing the client ----
+            let deadline = client_deadline(hs.keep_alive, last_client_activity);
             let wait: std::pin::Pin<Box<dyn std::future::Future<Output = Option<TcpStream>> + Send>> =
                 match step {
                     OutageStep::Connect => Box::pin(async move { TcpStream::connect(broker_addr).await.ok() }),
@@ -906,6 +962,7 @@ async fn forward_loop(
             tokio::select! {
                 next = client.next() => match next {
                     Some(Ok((p, _))) => {
+                        last_client_activity = std::time::Instant::now();
                         service_outage_packet(&mut client, p, &mut buffer, &mut subscriptions).await?;
                     }
                     Some(Err(e)) => return Err(invalid_data(e)),
@@ -957,6 +1014,11 @@ async fn forward_loop(
                         }
                     },
                 },
+                _ = tokio::time::sleep_until(deadline.into()) => {
+                    log::info!("session {id}: client keepalive timeout during outage, disconnecting");
+                    close_for_keepalive(&mut client, hs.version).await;
+                    return Ok(());
+                }
             }
         }
     }
