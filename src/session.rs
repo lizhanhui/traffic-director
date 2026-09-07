@@ -26,6 +26,7 @@ use tokio_util::codec::{Decoder, Encoder, Framed, FramedParts};
 use crate::registry::{
     FrozenSession, ResumeAction, SessionControl, SessionRegistry, SessionSnapshot,
 };
+use crate::window::InflightWindows;
 
 const MAX_PACKET_SIZE: u32 = 1024 * 1024;
 
@@ -175,7 +176,7 @@ pub async fn run_session(
         id,
     };
 
-    forward_loop(id, client, broker, hs, control).await
+    forward_loop(id, client, broker, hs, control, InflightWindows::new()).await
 }
 
 async fn forward_loop(
@@ -184,16 +185,23 @@ async fn forward_loop(
     mut broker: MqttFramed,
     hs: Handshake,
     mut control: mpsc::Receiver<SessionControl>,
+    mut windows: InflightWindows,
 ) -> io::Result<()> {
     loop {
         tokio::select! {
             next = client.next() => match next {
-                Some(Ok((p, _))) => broker.send(p).await.map_err(invalid_data)?,
+                Some(Ok((p, _))) => {
+                    windows.track_c2b(&p);
+                    broker.send(p).await.map_err(invalid_data)?;
+                }
                 Some(Err(e)) => return Err(invalid_data(e)),
                 None => return Ok(()),
             },
             next = broker.next() => match next {
-                Some(Ok((p, _))) => client.send(p).await.map_err(invalid_data)?,
+                Some(Ok((p, _))) => {
+                    windows.track_b2c(&p);
+                    client.send(p).await.map_err(invalid_data)?;
+                }
                 Some(Err(e)) => return Err(invalid_data(e)),
                 None => return Ok(()),
             },
@@ -206,12 +214,17 @@ async fn forward_loop(
                         connect_raw: hs.connect_raw.clone(),
                         client_buf: cp.read_buf.split().to_vec(),
                         broker_buf: bp.read_buf.split().to_vec(),
+                        windows: windows.snapshot(),
                     };
                     let mut frozen = FrozenSession {
                         id,
                         snapshot,
                         client_fd: cp.io.as_raw_fd(),
                     };
+                    log::debug!(
+                        "session {id} frozen with {} in-flight window entr(ies)",
+                        frozen.snapshot.windows.len()
+                    );
                     if let Err(returned) = req.reply.send(frozen) {
                         // Coordinator gave up on us: restore and carry on.
                         frozen = returned;
@@ -223,7 +236,8 @@ async fn forward_loop(
                     }
                     match req.resume.await {
                         Ok(ResumeAction::Resume(frozen)) => {
-                            // Rollback: restore buffers and continue.
+                            // Rollback: restore buffers and continue. The
+                            // windows never left this task, so just keep them.
                             cp.read_buf.extend_from_slice(&frozen.snapshot.client_buf);
                             bp.read_buf.extend_from_slice(&frozen.snapshot.broker_buf);
                             client = Framed::from_parts(cp);
@@ -304,9 +318,28 @@ pub async fn adopt_session(
         log::warn!("dropping {} partial broker bytes on thaw", leftover.len());
     }
 
+    // Retransmit QoS in-flight packets that never completed end-to-end.
+    let windows = InflightWindows::from_snapshot(snapshot.windows);
+    log::info!(
+        "thaw: retransmitting {} packet(s) toward broker, {} toward client",
+        windows.broker_retransmits().len(),
+        windows.client_retransmits().len()
+    );
+    {
+        use tokio::io::AsyncWriteExt;
+        for raw in windows.broker_retransmits() {
+            broker.get_mut().write_all(&raw).await?;
+        }
+        for raw in windows.client_retransmits() {
+            client.get_mut().write_all(&raw).await?;
+        }
+        broker.get_mut().flush().await?;
+        client.get_mut().flush().await?;
+    }
+
     // Register so the adopted session is migratable on the next shed.
     let (id, control) = registry.register();
     let _registration = Registration { registry, id };
 
-    forward_loop(id, client, broker, hs, control).await
+    forward_loop(id, client, broker, hs, control, windows).await
 }

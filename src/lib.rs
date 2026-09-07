@@ -4,6 +4,7 @@ pub mod migrate;
 pub mod registry;
 pub mod server;
 pub mod session;
+pub mod window;
 
 use std::io;
 use std::net::SocketAddr;

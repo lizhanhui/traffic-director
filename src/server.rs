@@ -15,7 +15,7 @@ use ecdysis::Ecdysis;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, spawn_blocking};
 
 use crate::migrate;
 use crate::registry::SessionRegistry;
@@ -138,26 +138,25 @@ pub async fn run(
     log::info!("listening on {listen}, proxying to {broker} (mode: {mode:?}, child: {is_child})");
 
     // Child in migrate mode: adopt the previous generation's sessions.
-    if is_child && mode == ShedMode::Migrate
+    if is_child
+        && mode == ShedMode::Migrate
         && let Some(from_parent) = from_parent
     {
         migrate::child_channel(&from_parent)?;
         let registry = registry.clone();
         tokio::spawn(async move {
-            let sessions =
-                match tokio::task::spawn_blocking(move || migrate::recv_sessions(&from_parent))
-                    .await
-                {
-                    Ok(Ok(sessions)) => sessions,
-                    Ok(Err(e)) => {
-                        log::error!("failed to receive migrated sessions: {e}");
-                        return;
-                    }
-                    Err(e) => {
-                        log::error!("migration receiver panicked: {e}");
-                        return;
-                    }
-                };
+            let sessions = match spawn_blocking(move || migrate::recv_sessions(&from_parent)).await
+            {
+                Ok(Ok(sessions)) => sessions,
+                Ok(Err(e)) => {
+                    log::error!("failed to receive migrated sessions: {e}");
+                    return;
+                }
+                Err(e) => {
+                    log::error!("migration receiver panicked: {e}");
+                    return;
+                }
+            };
             log::info!("adopting {} migrated session(s)", sessions.len());
             for (snapshot, fd) in sessions {
                 let registry = registry.clone();

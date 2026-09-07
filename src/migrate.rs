@@ -3,14 +3,15 @@
 //! pair. One datagram per session, acknowledged one at a time, then an END
 //! marker.
 
-use std::io;
+use std::io::{self, IoSlice, IoSliceMut};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 use std::time::Duration;
 
 use nix::cmsg_space;
 use nix::sys::socket::{
-    ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg, setsockopt, sockopt,
+    ControlMessage, ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg, sendmsg, setsockopt,
+    sockopt,
 };
 use nix::sys::time::TimeVal;
 
@@ -38,14 +39,14 @@ pub fn child_channel(sock: &UnixDatagram) -> io::Result<()> {
 }
 
 fn send_with_fd(sock: &UnixDatagram, payload: &[u8], fd: RawFd) -> io::Result<()> {
-    let iov = [std::io::IoSlice::new(payload)];
+    let iov = [IoSlice::new(payload)];
     let fds = [fd];
     sendmsg(
         sock.as_raw_fd(),
         &iov,
         &[ControlMessage::ScmRights(&fds)],
         MsgFlags::empty(),
-        None::<&nix::sys::socket::SockaddrStorage>,
+        None::<&SockaddrStorage>,
     )?;
     Ok(())
 }
@@ -54,7 +55,7 @@ fn recv_with_fd(sock: &UnixDatagram) -> io::Result<(Vec<u8>, Option<RawFd>)> {
     let mut buf = vec![0u8; 1024 * 1024];
     let mut cmsgspace = cmsg_space!([RawFd; 1]);
     let (n, fd) = {
-        let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+        let mut iov = [IoSliceMut::new(&mut buf)];
         let msg = recvmsg::<()>(
             sock.as_raw_fd(),
             &mut iov,
@@ -87,7 +88,10 @@ pub fn send_sessions(
 
         let (ack, _) = recv_with_fd(sock)?;
         if ack != ACK {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad handoff ack"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad handoff ack",
+            ));
         }
         *sent += 1;
     }

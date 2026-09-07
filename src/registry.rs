@@ -11,6 +11,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::window::WindowEntry;
+
 /// Everything the next process generation needs to adopt a session.
 /// `client_fd` travels out-of-band (SCM_RIGHTS) during a real shed.
 #[derive(Debug)]
@@ -31,6 +33,8 @@ pub struct SessionSnapshot {
     pub client_buf: Vec<u8>,
     /// Undelivered bytes from the broker, still frame-aligned.
     pub broker_buf: Vec<u8>,
+    /// QoS1/2 packets forwarded but not yet acknowledged end-to-end.
+    pub windows: Vec<WindowEntry>,
 }
 
 pub enum SessionControl {
