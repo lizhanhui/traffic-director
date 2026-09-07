@@ -60,7 +60,11 @@ client ──MQTT──▶ traffic-director ──MQTT──▶ broker
                   subscriptions + QoS windows]
 ```
 
-- **Session core** (`src/session.rs`): one actor per client connection.
+- **Session core** (`src/session/`): one actor per client connection,
+  split into focused modules — `handshake` (CONNECT capture and clean-bit
+  patch), `subscriptions` (subscription table), `outage` (broker-down
+  buffering and retry), `keepalive` (local PINGRESP and 1.5× enforcement),
+  `forward` (the two-phase loop, freeze/thaw, entry points).
   Terminates MQTT both sides; packet ids pass through 1:1 (each session owns
   exactly one broker connection), so broker acks chain to the client
   unchanged.
@@ -219,11 +223,12 @@ loss, and no message loss beyond what QoS0 permits.
 | Migrate shed (PoC 2) | Parent exits immediately; client TCP socket survives (same 4-tuple); no MQTT reconnect |
 | QoS1/2 in-flight windows | Unacked publishes retransmitted DUP=1 on thaw; QoS2 PUBREC/PUBREL state survives at every handshake step, both directions |
 | Subscription restore | Tracked SUBSCRIBE/UNSUBSCRIBE re-issued on reconnect; replayed CONNECT forced `clean_start/clean_session=false` |
-| Broker outage mode | Client stays connected; local PUBACK/PUBREC with bounded buffering (1 MiB); local keepalives and sub management; flush on recovery |
+| Broker outage mode | Client stays connected; publishes buffered **without acking** (bounded 1 MiB) so backpressure, not silent loss; acks chain from the broker on recovery |
+| Keepalive termination | Instant local PINGRESP in every state; PINGREQ still forwarded upstream; upstream PINGRESP swallowed; 1.5× silence enforcement with v5 `KeepAliveTimeout` DISCONNECT; honors server-assigned keepalive |
 | Server DISCONNECT interception (v5) | Administrative reasons swallowed → quiet reconnect; client-fault reasons forwarded |
 | Upgrade failure rollback | Failed child boot → sessions resume in place; parent keeps serving |
 
-Test suite: 31 tests across unit, in-process thaw (deterministic fake
+Test suite: 38 tests across unit, in-process thaw (deterministic fake
 brokers), and real-binary/real-mosquitto e2e, all green with repeated runs.
 
 ## Pros and cons
