@@ -18,12 +18,12 @@ use tokio_util::codec::{Decoder, Framed, FramedParts};
 use crate::registry::{
     FrozenSession, ResumeAction, SessionControl, SessionRegistry, SessionSnapshot,
 };
-use crate::window::InflightWindows;
+use crate::window::{InflightWindows, WindowState};
 
 use super::handshake::{Handshake, force_session_resumption, handshake};
 use super::keepalive::{client_deadline, close_for_keepalive};
 use super::outage::{
-    BROKER_RETRY_INITIAL, BROKER_RETRY_MAX, LocalAcks, OutageBuffer, service_outage_packet,
+    BROKER_RETRY_INITIAL, BROKER_RETRY_MAX, OutageBuffer, service_outage_packet,
 };
 use super::subscriptions::Subscriptions;
 use super::{MqttFramed, Registration, codec_for, invalid_data};
@@ -40,8 +40,7 @@ async fn establish_broker(
     connect_raw: &[u8],
     client: &mut MqttFramed,
     subscriptions: &Subscriptions,
-    windows: &InflightWindows,
-    local_acks: &mut LocalAcks,
+    windows: &mut InflightWindows,
     buffer: &mut OutageBuffer,
     broker_leftover: &mut BytesMut,
     keep_alive: &mut u16,
@@ -132,17 +131,21 @@ async fn establish_broker(
             client.get_mut().write_all(&raw).await?;
         }
         if !buffer.entries.is_empty() {
-            log::info!("flushing {} outage-buffered publish(es)", buffer.entries.len());
+            log::info!("flushing {} outage-buffered packet(s)", buffer.entries.len());
         }
         for entry in buffer.entries.drain(..) {
-            match entry.qos {
-                1 => {
-                    local_acks.qos1.insert(entry.packet_id);
-                }
-                2 => {
-                    local_acks.qos2.insert(entry.packet_id);
-                }
-                other => unreachable!("QoS{other} is never buffered"),
+            match entry.raw[0] >> 4 {
+                3 => windows.insert_c2b_raw(
+                    entry.packet_id,
+                    WindowState::C2BPublishSent,
+                    entry.raw.clone(),
+                ),
+                6 => windows.insert_c2b_raw(
+                    entry.packet_id,
+                    WindowState::C2BPubrelSent,
+                    entry.raw.clone(),
+                ),
+                _ => {} // SUBSCRIBE/UNSUBSCRIBE: acks chain normally
             }
             broker.get_mut().write_all(&entry.raw).await?;
         }
@@ -275,7 +278,6 @@ pub async fn run_session(
         control,
         InflightWindows::new(),
         Subscriptions::default(),
-        LocalAcks::default(),
         OutageBuffer::default(),
         BytesMut::new(),
     )
@@ -315,7 +317,6 @@ async fn forward_loop(
     mut control: mpsc::Receiver<SessionControl>,
     mut windows: InflightWindows,
     mut subscriptions: Subscriptions,
-    mut local_acks: LocalAcks,
     mut buffer: OutageBuffer,
     mut broker_leftover: BytesMut,
 ) -> io::Result<()> {
@@ -382,50 +383,11 @@ async fn forward_loop(
                             return Ok(());
                         }
                         broker = Some(b);
-                        // Broker acks for outage-buffered publishes belong
-                        // to the proxy; the client was already acked locally.
                         match &p {
                             // Upstream PINGRESP: the client was already
                             // answered locally — swallow it.
                             MqttPacket::V3(v3::Packet::PingResponse)
                             | MqttPacket::V5(v5::Packet::PingResponse) => {}
-                            MqttPacket::V3(v3::Packet::PublishAck { packet_id })
-                                if local_acks.qos1.remove(&packet_id.get()) => {}
-                            MqttPacket::V3(v3::Packet::PublishReceived { packet_id })
-                                if local_acks.qos2.contains(&packet_id.get()) =>
-                            {
-                                broker
-                                    .as_mut()
-                                    .unwrap()
-                                    .send(MqttPacket::V3(v3::Packet::PublishRelease {
-                                        packet_id: *packet_id,
-                                    }))
-                                    .await
-                                    .map_err(invalid_data)?;
-                            }
-                            MqttPacket::V3(v3::Packet::PublishComplete { packet_id })
-                                if local_acks.qos2.remove(&packet_id.get()) => {}
-                            MqttPacket::V5(v5::Packet::PublishAck(ack))
-                                if local_acks.qos1.remove(&ack.packet_id.get()) => {}
-                            MqttPacket::V5(v5::Packet::PublishReceived(ack))
-                                if local_acks.qos2.contains(&ack.packet_id.get()) =>
-                            {
-                                broker
-                                    .as_mut()
-                                    .unwrap()
-                                    .send(MqttPacket::V5(v5::Packet::PublishRelease(
-                                        v5::PublishAck2 {
-                                            packet_id: ack.packet_id,
-                                            reason_code: v5::PublishAck2Reason::Success,
-                                            properties: Vec::new(),
-                                            reason_string: None,
-                                        },
-                                    )))
-                                    .await
-                                    .map_err(invalid_data)?;
-                            }
-                            MqttPacket::V5(v5::Packet::PublishComplete(ack))
-                                if local_acks.qos2.remove(&ack.packet_id.get()) => {}
                             _ => {
                                 windows.track_b2c(&p);
                                 client.send(p).await.map_err(invalid_data)?;
@@ -480,7 +442,7 @@ async fn forward_loop(
                 next = client.next() => match next {
                     Some(Ok((p, _))) => {
                         last_client_activity = std::time::Instant::now();
-                        service_outage_packet(&mut client, p, &mut buffer, &mut subscriptions).await?;
+                        service_outage_packet(&mut client, p, &mut buffer, &mut subscriptions, &mut windows).await?;
                     }
                     Some(Err(e)) => return Err(invalid_data(e)),
                     None => return Ok(()),
@@ -511,8 +473,7 @@ async fn forward_loop(
                             &hs.connect_raw,
                             &mut client,
                             &subscriptions,
-                            &windows,
-                            &mut local_acks,
+                            &mut windows,
                             &mut buffer,
                             &mut broker_leftover,
                             &mut hs.keep_alive,
@@ -585,7 +546,6 @@ pub async fn adopt_session(
         control,
         windows,
         subscriptions,
-        LocalAcks::default(),
         buffer,
         broker_leftover,
     )

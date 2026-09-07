@@ -107,7 +107,10 @@ async fn broker_down_during_migration_buffers_and_recovers() {
     // During the outage the proxy answers keepalives locally...
     v3_ping(&mut a).await;
 
-    // ...and locally acks QoS1 publishes, buffering them for the broker.
+    // ...but does NOT ack publishes: QoS guarantees would break if the
+    // proxy acked on behalf of a broker that never saw the message. The
+    // client's in-flight window throttles publishing (backpressure); the
+    // proxy buffers what it already received.
     for i in 0..5u16 {
         let publish = Publish {
             dup: false,
@@ -121,31 +124,38 @@ async fn broker_down_during_migration_buffers_and_recovers() {
         a.send(MqttPacket::V3(v3::Packet::Publish(Box::new(publish))))
             .await
             .unwrap();
-        match next_packet(&mut a).await {
-            MqttPacket::V3(v3::Packet::PublishAck { packet_id }) => {
-                assert_eq!(packet_id.get(), 10 + i);
-            }
-            other => panic!("expected local PublishAck during outage, got {other:?}"),
-        }
     }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), next_packet(&mut a))
+            .await
+            .is_err(),
+        "proxy acked a publish the broker never saw"
+    );
 
     // Bring the broker back; the child's backoff retry reconnects and
-    // flushes the buffer. A is subscribed, so it receives its own buffered
-    // messages back on the surviving connection.
+    // flushes the buffer. The broker's PUBACKs now chain to the client, and
+    // A is subscribed, so it also receives its own buffered messages back on
+    // the surviving connection.
     broker.start();
     wait_connectable(broker_addr).await;
 
+    let mut acked = std::collections::HashSet::new();
     let mut received = std::collections::HashSet::new();
-    while received.len() < 5 {
+    while acked.len() < 5 || received.len() < 5 {
         match next_packet(&mut a).await {
+            MqttPacket::V3(v3::Packet::PublishAck { packet_id }) => {
+                assert!(
+                    (10..15).contains(&packet_id.get()),
+                    "unexpected PUBACK id {packet_id}"
+                );
+                acked.insert(packet_id.get());
+            }
             MqttPacket::V3(v3::Packet::Publish(p)) => {
                 let payload = String::from_utf8(p.payload.to_vec()).unwrap();
                 assert!(payload.starts_with("buffered-"), "unexpected publish: {payload}");
                 received.insert(payload);
             }
-            // Tolerate anything else (e.g. re-SUBSCRIBE artifacts) while
-            // waiting.
-            _ => continue,
+            other => panic!("unexpected packet during recovery: {other:?}"),
         }
     }
 }

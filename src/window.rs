@@ -151,6 +151,12 @@ impl InflightWindows {
         }
     }
 
+    /// Insert a raw packet directly (used when flushing the outage buffer,
+    /// where packets exist only in encoded form).
+    pub(crate) fn insert_c2b_raw(&mut self, packet_id: u16, state: WindowState, raw: Vec<u8>) {
+        vec_insert(&mut self.c2b, packet_id, (state, raw));
+    }
+
     fn c2b_insert(
         &mut self,
         qos: QoS,

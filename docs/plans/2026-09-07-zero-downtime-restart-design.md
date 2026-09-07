@@ -119,9 +119,11 @@ reloaded.
   sequence; supervisor-level recovery is out of scope.
 - **Broker unreachable during migration (PoC 2):** session is not dropped; it
   retries the broker-side connection with backoff while the client socket
-  stays open. Inbound client PUBLISHs are answered per QoS and buffered in the
-  window (bounded) until the broker link returns; on buffer overflow the
-  client is disconnected.
+  stays open. Inbound client PUBLISHs are buffered *unacked* (bounded)
+  until the broker link returns — acks chain from the broker — preserving
+  end-to-end QoS guarantees; the client's in-flight window provides
+  backpressure, and on buffer overflow the client is disconnected so its
+  reconnect retransmits unacked packets with DUP.
 - **No healthy backend at accept time:** reject CONNECT with reason code
   `0x88` (v5) / `0x03` (v3.1.1), close cleanly.
 - **Codec/protocol errors:** malformed packet → log and close that session

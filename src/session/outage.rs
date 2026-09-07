@@ -47,52 +47,65 @@ impl OutageBuffer {
     }
 }
 
-/// Broker ack packet ids that must NOT be forwarded to the client: the
-/// client was already acked locally during the outage.
-#[derive(Default)]
-pub(super) struct LocalAcks {
-    pub(super) qos1: std::collections::HashSet<u16>,
-    pub(super) qos2: std::collections::HashSet<u16>,
-}
+// Buffered client packet kinds are self-describing via the MQTT packet
+// type nibble in `raw[0]`.
 
-/// Answer and/or buffer one client packet received during a broker outage.
+/// Service one client packet during a broker outage. Withholding policy:
+/// nothing that implies broker acceptance is answered locally — QoS
+/// guarantees would break if the proxy acked on behalf of a broker that
+/// never saw the message. Only keepalive (connection liveness, not
+/// delivery) is answered locally.
 pub(super) async fn service_outage_packet(
     client: &mut MqttFramed,
     packet: MqttPacket,
     buffer: &mut OutageBuffer,
     subscriptions: &mut Subscriptions,
+    windows: &mut crate::window::InflightWindows,
 ) -> io::Result<()> {
     use rmqtt_codec::types::QoS;
+
+    // Client acks of broker publishes keep the b2c window accurate; the
+    // broker never sees them while down — session-resumption redelivery
+    // heals the handshake after reconnect.
+    match &packet {
+        MqttPacket::V3(
+            v3::Packet::PublishAck { .. }
+            | v3::Packet::PublishReceived { .. }
+            | v3::Packet::PublishComplete { .. },
+        )
+        | MqttPacket::V5(
+            v5::Packet::PublishAck(_)
+            | v5::Packet::PublishReceived(_)
+            | v5::Packet::PublishComplete(_),
+        ) => {
+            windows.track_c2b(&packet);
+            return Ok(());
+        }
+        _ => {}
+    }
+
     match packet {
+        // Publishes with a delivery guarantee: buffer WITHOUT acking. The
+        // client's in-flight window provides the backpressure; on overflow
+        // the session closes and the client's reconnect retransmits.
         MqttPacket::V3(v3::Packet::Publish(p)) => {
-                let packet_id = p.packet_id;
-                let qos = p.qos;
-                let raw = encode_raw(&MqttPacket::V3(v3::Packet::Publish(p)));
-                match qos {
-                    QoS::AtMostOnce => {} // at-most-once: may be dropped
-                    QoS::AtLeastOnce => {
-                        let packet_id = packet_id.expect("QoS1 PUBLISH has an id");
-                        buffer.push(packet_id.get(), raw, qos)?;
-                        client
-                            .send(MqttPacket::V3(v3::Packet::PublishAck { packet_id }))
-                            .await
-                            .map_err(invalid_data)?;
-                    }
-                    QoS::ExactlyOnce => {
-                        let packet_id = packet_id.expect("QoS2 PUBLISH has an id");
-                        buffer.push(packet_id.get(), raw, qos)?;
-                        client
-                            .send(MqttPacket::V3(v3::Packet::PublishReceived { packet_id }))
-                            .await
-                            .map_err(invalid_data)?;
-                    }
+            let packet_id = p.packet_id;
+            let qos = p.qos;
+            let raw = encode_raw(&MqttPacket::V3(v3::Packet::Publish(p)));
+            match qos {
+                QoS::AtMostOnce => {} // at-most-once: may be dropped
+                _ => {
+                    let packet_id = packet_id.expect("QoS>0 PUBLISH has an id");
+                    buffer.push(packet_id.get(), raw, qos)?;
                 }
+            }
         }
         MqttPacket::V3(v3::Packet::PublishRelease { packet_id }) => {
-            client
-                .send(MqttPacket::V3(v3::Packet::PublishComplete { packet_id }))
-                .await
-                .map_err(invalid_data)?;
+            // Part of a QoS2 handshake whose PUBREC the client already got
+            // from the broker; buffered and forwarded after reconnect, in
+            // order behind the window retransmits.
+            let raw = encode_raw(&MqttPacket::V3(v3::Packet::PublishRelease { packet_id }));
+            buffer.push(packet_id.get(), raw, QoS::ExactlyOnce)?;
         }
         MqttPacket::V3(v3::Packet::PingRequest) => {
             client
@@ -102,81 +115,42 @@ pub(super) async fn service_outage_packet(
         }
         p @ MqttPacket::V3(v3::Packet::Subscribe { .. }) => {
             subscriptions.track(&p);
-            let MqttPacket::V3(v3::Packet::Subscribe {
-                packet_id,
-                topic_filters,
-            }) = p
-            else {
+            let MqttPacket::V3(v3::Packet::Subscribe { packet_id, .. }) = &p else {
                 unreachable!()
             };
-            client
-                .send(MqttPacket::V3(v3::Packet::SubscribeAck {
-                    packet_id,
-                    status: topic_filters
-                        .iter()
-                        .map(|(_, qos)| v3::SubscribeReturnCode::Success(*qos))
-                        .collect(),
-                }))
-                .await
-                .map_err(invalid_data)?;
+            let packet_id = *packet_id;
+            // Withheld: the SUBACK must come from the broker after
+            // reconnect, or the client would believe in a subscription the
+            // broker never granted.
+            buffer.push(packet_id.get(), encode_raw(&p), QoS::AtLeastOnce)?;
         }
         p @ MqttPacket::V3(v3::Packet::Unsubscribe { .. }) => {
             subscriptions.track(&p);
-            let MqttPacket::V3(v3::Packet::Unsubscribe { packet_id, .. }) = p else {
+            let MqttPacket::V3(v3::Packet::Unsubscribe { packet_id, .. }) = &p else {
                 unreachable!()
             };
-            client
-                .send(MqttPacket::V3(v3::Packet::UnsubscribeAck { packet_id }))
-                .await
-                .map_err(invalid_data)?;
+            let packet_id = *packet_id;
+            buffer.push(packet_id.get(), encode_raw(&p), QoS::AtLeastOnce)?;
         }
         MqttPacket::V3(v3::Packet::Disconnect) => {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "client disconnected"));
         }
         MqttPacket::V5(v5::Packet::Publish(p)) => {
-                let packet_id = p.packet_id;
-                let qos = p.qos;
-                let raw = encode_raw(&MqttPacket::V5(v5::Packet::Publish(p)));
-                match qos {
-                    QoS::AtMostOnce => {}
-                    QoS::AtLeastOnce => {
-                        let packet_id = packet_id.expect("QoS1 PUBLISH has an id");
-                        buffer.push(packet_id.get(), raw, qos)?;
-                        client
-                            .send(MqttPacket::V5(v5::Packet::PublishAck(v5::PublishAck {
-                                packet_id,
-                                reason_code: v5::PublishAckReason::Success,
-                                properties: Vec::new(),
-                                reason_string: None,
-                            })))
-                            .await
-                            .map_err(invalid_data)?;
-                    }
-                    QoS::ExactlyOnce => {
-                        let packet_id = packet_id.expect("QoS2 PUBLISH has an id");
-                        buffer.push(packet_id.get(), raw, qos)?;
-                        client
-                            .send(MqttPacket::V5(v5::Packet::PublishReceived(v5::PublishAck {
-                                packet_id,
-                                reason_code: v5::PublishAckReason::Success,
-                                properties: Vec::new(),
-                                reason_string: None,
-                            })))
-                            .await
-                            .map_err(invalid_data)?;
-                    }
+            let packet_id = p.packet_id;
+            let qos = p.qos;
+            let raw = encode_raw(&MqttPacket::V5(v5::Packet::Publish(p)));
+            match qos {
+                QoS::AtMostOnce => {}
+                _ => {
+                    let packet_id = packet_id.expect("QoS>0 PUBLISH has an id");
+                    buffer.push(packet_id.get(), raw, qos)?;
                 }
+            }
         }
         MqttPacket::V5(v5::Packet::PublishRelease(ack)) => {
-            client
-                .send(MqttPacket::V5(v5::Packet::PublishComplete(v5::PublishAck2 {
-                    packet_id: ack.packet_id,
-                    reason_code: v5::PublishAck2Reason::Success,
-                    properties: Vec::new(),
-                    reason_string: None,
-                })))
-                .await
-                .map_err(invalid_data)?;
+            let packet_id = ack.packet_id;
+            let raw = encode_raw(&MqttPacket::V5(v5::Packet::PublishRelease(ack)));
+            buffer.push(packet_id.get(), raw, QoS::ExactlyOnce)?;
         }
         MqttPacket::V5(v5::Packet::PingRequest) => {
             client
@@ -186,46 +160,22 @@ pub(super) async fn service_outage_packet(
         }
         p @ MqttPacket::V5(v5::Packet::Subscribe(_)) => {
             subscriptions.track(&p);
-            let MqttPacket::V5(v5::Packet::Subscribe(subscribe)) = p else {
+            let MqttPacket::V5(v5::Packet::Subscribe(subscribe)) = &p else {
                 unreachable!()
             };
-            client
-                .send(MqttPacket::V5(v5::Packet::SubscribeAck(v5::SubscribeAck {
-                    packet_id: subscribe.packet_id,
-                    properties: Vec::new(),
-                    reason_string: None,
-                    status: subscribe
-                        .topic_filters
-                        .iter()
-                        .map(|(_, options)| match options.qos {
-                            QoS::AtMostOnce => v5::SubscribeAckReason::GrantedQos0,
-                            QoS::AtLeastOnce => v5::SubscribeAckReason::GrantedQos1,
-                            QoS::ExactlyOnce => v5::SubscribeAckReason::GrantedQos2,
-                        })
-                        .collect(),
-                })))
-                .await
-                .map_err(invalid_data)?;
+            buffer.push(subscribe.packet_id.get(), encode_raw(&p), QoS::AtLeastOnce)?;
         }
         p @ MqttPacket::V5(v5::Packet::Unsubscribe(_)) => {
             subscriptions.track(&p);
-            let MqttPacket::V5(v5::Packet::Unsubscribe(unsubscribe)) = p else {
+            let MqttPacket::V5(v5::Packet::Unsubscribe(unsubscribe)) = &p else {
                 unreachable!()
             };
-            client
-                .send(MqttPacket::V5(v5::Packet::UnsubscribeAck(v5::UnsubscribeAck {
-                    packet_id: unsubscribe.packet_id,
-                    properties: Vec::new(),
-                    reason_string: None,
-                    status: Vec::new(),
-                })))
-                .await
-                .map_err(invalid_data)?;
+            buffer.push(unsubscribe.packet_id.get(), encode_raw(&p), QoS::AtLeastOnce)?;
         }
         MqttPacket::V5(v5::Packet::Disconnect(_)) => {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "client disconnected"));
         }
-        _ => {} // client acks of broker publishes: nothing to do mid-outage
+        _ => {}
     }
     Ok(())
 }

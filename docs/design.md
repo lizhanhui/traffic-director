@@ -173,11 +173,16 @@ becomes a temporary stand-in for the broker:
   spec). The enforced interval honors the v5 Server Keep Alive assigned in
   CONNACK, including on reconnects, while the CONNACK itself is forwarded
   verbatim so the client adopts the same value.
-- **QoS1/2 publishes are acked locally and buffered** (bounded at 1 MiB,
-  then the session closes rather than endangering the process). QoS0 is
-  dropped, which at-most-once semantics permit.
-- **SUBSCRIBE/UNSUBSCRIBE are acked locally and recorded** in the
-  subscription table.
+- **QoS1/2 publishes, PUBREL, SUBSCRIBE, and UNSUBSCRIBE are buffered
+  without acking.** The proxy never acks on behalf of a broker that hasn't
+  seen the packet — a local ack would tell the client the message was
+  accepted when it wasn't, and a proxy crash would then lose it silently.
+  Instead, end-to-end ack chaining is preserved: the client's own
+  in-flight window (v5 receive-maximum, or the client's send window in v3)
+  throttles publishing naturally. The buffer is bounded (1 MiB); on
+  overflow the session closes, and the client's reconnect retransmits the
+  unacked packets with DUP — the protocol heals itself. QoS0 is dropped,
+  which at-most-once semantics permit.
 - Meanwhile the proxy retries the broker with exponential backoff:
   100 ms initial, doubling, capped at 5 s, indefinitely. The client socket
   is serviced throughout — including freeze requests, so a proxy upgrade
@@ -197,10 +202,9 @@ becomes a temporary stand-in for the broker:
 4. QoS in-flight windows are retransmitted: unacked client→broker
    publishes go out with DUP=1 (or PUBREL for mid-handshake QoS2);
    unacked broker→client publishes are replayed downstream the same way.
-5. The outage buffer is flushed in arrival order. Because the client was
-   already acked locally, the broker's acks for these packet ids are eaten
-   by the proxy instead of being forwarded — the client sees each message
-   acknowledged exactly once.
+5. The outage buffer is flushed in arrival order; flushed publishes and
+   PUBRELs enter the c2b window, so the broker's PUBACKs/PUBRECs/PUBCOMPs
+   chain to the client exactly as if the outage never happened.
 
 The client-visible result of a broker rolling update is a brief pause in
 broker-originated traffic; no DISCONNECT, no reconnect, no subscription
@@ -245,10 +249,11 @@ brokers), and real-binary/real-mosquitto e2e, all green with repeated runs.
 - **One broker connection per client**: no connection pooling; broker sees
   the same connection count as clients. Large fleets need the broker tuned
   accordingly.
-- **Local acking during outages changes semantics**: while the broker is
-  down the proxy acks publishes itself (bounded). A client that would
-  otherwise notice an outage within one round-trip now sees "acknowledged"
-  messages that are only proxy-buffered.
+- **Outages stall publishers instead of losing messages**: while the broker
+  is down, QoS1/2 publishes are buffered unacked, so clients stop sending
+  once their in-flight window fills. Correct per MQTT, but a publisher
+  expecting progress sees the outage as backpressure (which is honest, but
+  changes observable behavior versus a direct connection that would break).
 - **QoS1 duplicates possible at migration boundaries**: window replay plus
   broker redelivery can deliver a message twice. Protocol-normal for QoS1,
   but exactly-once *application* semantics still require idempotent
