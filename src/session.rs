@@ -27,7 +27,7 @@ use crate::registry::{
     FrozenSession, ResumeAction, SessionControl, SessionRegistry, SessionSnapshot,
     SubscriptionEntry,
 };
-use crate::window::InflightWindows;
+use crate::window::{InflightWindows, encode_raw};
 
 const MAX_PACKET_SIZE: u32 = 1024 * 1024;
 
@@ -144,6 +144,400 @@ impl Subscriptions {
         };
         Some(packet)
     }
+}
+
+const BROKER_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(100);
+const BROKER_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+const OUTAGE_BUFFER_MAX_BYTES: usize = 1024 * 1024;
+
+/// Publishes received from the client while the broker was unreachable,
+/// already acked locally and awaiting delivery after reconnect.
+#[derive(Default)]
+struct OutageBuffer {
+    entries: Vec<crate::registry::BufferedPublish>,
+    bytes: usize,
+}
+
+impl OutageBuffer {
+    fn push(
+        &mut self,
+        packet_id: u16,
+        raw: Vec<u8>,
+        qos: rmqtt_codec::types::QoS,
+    ) -> io::Result<()> {
+        if self.bytes + raw.len() > OUTAGE_BUFFER_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::QuotaExceeded,
+                "outage buffer full, closing session",
+            ));
+        }
+        self.bytes += raw.len();
+        self.entries.push(crate::registry::BufferedPublish {
+            packet_id,
+            raw,
+            qos: qos as u8,
+        });
+        Ok(())
+    }
+}
+
+/// Broker ack packet ids that must NOT be forwarded to the client: the
+/// client was already acked locally during the outage.
+#[derive(Default)]
+pub struct LocalAcks {
+    qos1: std::collections::HashSet<u16>,
+    qos2: std::collections::HashSet<u16>,
+}
+
+/// Answer and/or buffer one client packet received during a broker outage.
+async fn service_outage_packet(
+    client: &mut MqttFramed,
+    packet: MqttPacket,
+    buffer: &mut OutageBuffer,
+    subscriptions: &mut Subscriptions,
+) -> io::Result<()> {
+    use rmqtt_codec::types::QoS;
+    match packet {
+        MqttPacket::V3(v3::Packet::Publish(p)) => {
+                let packet_id = p.packet_id;
+                let qos = p.qos;
+                let raw = encode_raw(&MqttPacket::V3(v3::Packet::Publish(p)));
+                match qos {
+                    QoS::AtMostOnce => {} // at-most-once: may be dropped
+                    QoS::AtLeastOnce => {
+                        let packet_id = packet_id.expect("QoS1 PUBLISH has an id");
+                        buffer.push(packet_id.get(), raw, qos)?;
+                        client
+                            .send(MqttPacket::V3(v3::Packet::PublishAck { packet_id }))
+                            .await
+                            .map_err(invalid_data)?;
+                    }
+                    QoS::ExactlyOnce => {
+                        let packet_id = packet_id.expect("QoS2 PUBLISH has an id");
+                        buffer.push(packet_id.get(), raw, qos)?;
+                        client
+                            .send(MqttPacket::V3(v3::Packet::PublishReceived { packet_id }))
+                            .await
+                            .map_err(invalid_data)?;
+                    }
+                }
+        }
+        MqttPacket::V3(v3::Packet::PublishRelease { packet_id }) => {
+            client
+                .send(MqttPacket::V3(v3::Packet::PublishComplete { packet_id }))
+                .await
+                .map_err(invalid_data)?;
+        }
+        MqttPacket::V3(v3::Packet::PingRequest) => {
+            client
+                .send(MqttPacket::V3(v3::Packet::PingResponse))
+                .await
+                .map_err(invalid_data)?;
+        }
+        p @ MqttPacket::V3(v3::Packet::Subscribe { .. }) => {
+            subscriptions.track(&p);
+            let MqttPacket::V3(v3::Packet::Subscribe {
+                packet_id,
+                topic_filters,
+            }) = p
+            else {
+                unreachable!()
+            };
+            client
+                .send(MqttPacket::V3(v3::Packet::SubscribeAck {
+                    packet_id,
+                    status: topic_filters
+                        .iter()
+                        .map(|(_, qos)| v3::SubscribeReturnCode::Success(*qos))
+                        .collect(),
+                }))
+                .await
+                .map_err(invalid_data)?;
+        }
+        p @ MqttPacket::V3(v3::Packet::Unsubscribe { .. }) => {
+            subscriptions.track(&p);
+            let MqttPacket::V3(v3::Packet::Unsubscribe { packet_id, .. }) = p else {
+                unreachable!()
+            };
+            client
+                .send(MqttPacket::V3(v3::Packet::UnsubscribeAck { packet_id }))
+                .await
+                .map_err(invalid_data)?;
+        }
+        MqttPacket::V3(v3::Packet::Disconnect) => {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "client disconnected"));
+        }
+        MqttPacket::V5(v5::Packet::Publish(p)) => {
+                let packet_id = p.packet_id;
+                let qos = p.qos;
+                let raw = encode_raw(&MqttPacket::V5(v5::Packet::Publish(p)));
+                match qos {
+                    QoS::AtMostOnce => {}
+                    QoS::AtLeastOnce => {
+                        let packet_id = packet_id.expect("QoS1 PUBLISH has an id");
+                        buffer.push(packet_id.get(), raw, qos)?;
+                        client
+                            .send(MqttPacket::V5(v5::Packet::PublishAck(v5::PublishAck {
+                                packet_id,
+                                reason_code: v5::PublishAckReason::Success,
+                                properties: Vec::new(),
+                                reason_string: None,
+                            })))
+                            .await
+                            .map_err(invalid_data)?;
+                    }
+                    QoS::ExactlyOnce => {
+                        let packet_id = packet_id.expect("QoS2 PUBLISH has an id");
+                        buffer.push(packet_id.get(), raw, qos)?;
+                        client
+                            .send(MqttPacket::V5(v5::Packet::PublishReceived(v5::PublishAck {
+                                packet_id,
+                                reason_code: v5::PublishAckReason::Success,
+                                properties: Vec::new(),
+                                reason_string: None,
+                            })))
+                            .await
+                            .map_err(invalid_data)?;
+                    }
+                }
+        }
+        MqttPacket::V5(v5::Packet::PublishRelease(ack)) => {
+            client
+                .send(MqttPacket::V5(v5::Packet::PublishComplete(v5::PublishAck2 {
+                    packet_id: ack.packet_id,
+                    reason_code: v5::PublishAck2Reason::Success,
+                    properties: Vec::new(),
+                    reason_string: None,
+                })))
+                .await
+                .map_err(invalid_data)?;
+        }
+        MqttPacket::V5(v5::Packet::PingRequest) => {
+            client
+                .send(MqttPacket::V5(v5::Packet::PingResponse))
+                .await
+                .map_err(invalid_data)?;
+        }
+        p @ MqttPacket::V5(v5::Packet::Subscribe(_)) => {
+            subscriptions.track(&p);
+            let MqttPacket::V5(v5::Packet::Subscribe(subscribe)) = p else {
+                unreachable!()
+            };
+            client
+                .send(MqttPacket::V5(v5::Packet::SubscribeAck(v5::SubscribeAck {
+                    packet_id: subscribe.packet_id,
+                    properties: Vec::new(),
+                    reason_string: None,
+                    status: subscribe
+                        .topic_filters
+                        .iter()
+                        .map(|(_, options)| match options.qos {
+                            QoS::AtMostOnce => v5::SubscribeAckReason::GrantedQos0,
+                            QoS::AtLeastOnce => v5::SubscribeAckReason::GrantedQos1,
+                            QoS::ExactlyOnce => v5::SubscribeAckReason::GrantedQos2,
+                        })
+                        .collect(),
+                })))
+                .await
+                .map_err(invalid_data)?;
+        }
+        p @ MqttPacket::V5(v5::Packet::Unsubscribe(_)) => {
+            subscriptions.track(&p);
+            let MqttPacket::V5(v5::Packet::Unsubscribe(unsubscribe)) = p else {
+                unreachable!()
+            };
+            client
+                .send(MqttPacket::V5(v5::Packet::UnsubscribeAck(v5::UnsubscribeAck {
+                    packet_id: unsubscribe.packet_id,
+                    properties: Vec::new(),
+                    reason_string: None,
+                    status: Vec::new(),
+                })))
+                .await
+                .map_err(invalid_data)?;
+        }
+        MqttPacket::V5(v5::Packet::Disconnect(_)) => {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "client disconnected"));
+        }
+        _ => {} // client acks of broker publishes: nothing to do mid-outage
+    }
+    Ok(())
+}
+
+/// Replay the session onto a fresh broker connection: CONNECT with the clean
+/// bit cleared, re-SUBSCRIBE, deliver leftover broker bytes to the client,
+/// retransmit QoS windows, and flush the outage buffer (marking the flushed
+/// packet ids as proxy-local acks to eat). Shared by mid-session reconnect
+/// and thaw.
+#[allow(clippy::too_many_arguments)]
+async fn establish_broker(
+    broker: &mut MqttFramed,
+    hs: &Handshake,
+    client: &mut MqttFramed,
+    subscriptions: &Subscriptions,
+    windows: &InflightWindows,
+    local_acks: &mut LocalAcks,
+    buffer: &mut OutageBuffer,
+    broker_leftover: &mut BytesMut,
+) -> io::Result<()> {
+    // CONNECT replay with forced session resumption; CONNACK stays
+    // proxy-local since the client never disconnected.
+    let mut connect_raw = hs.connect_raw.clone();
+    force_session_resumption(&mut connect_raw)?;
+    {
+        use tokio::io::AsyncWriteExt;
+        broker.get_mut().write_all(&connect_raw).await?;
+        broker.get_mut().flush().await?;
+    }
+    match broker.next().await {
+        Some(Ok((MqttPacket::V3(v3::Packet::ConnectAck(_)), _)))
+        | Some(Ok((MqttPacket::V5(v5::Packet::ConnectAck(_)), _))) => {}
+        Some(Ok((other, _))) => {
+            return Err(invalid_data(format!("broker answered CONNECT replay with {other:?}")));
+        }
+        Some(Err(e)) => return Err(invalid_data(e)),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "broker closed during CONNECT replay",
+            ));
+        }
+    }
+
+    // Re-SUBSCRIBE; proxy-internal, so the SUBACK is not forwarded.
+    if let Some(packet) = subscriptions.resubscribe_packet(hs.version) {
+        broker.send(packet).await.map_err(invalid_data)?;
+        match broker.next().await {
+            Some(Ok((MqttPacket::V3(v3::Packet::SubscribeAck { .. }), _)))
+            | Some(Ok((MqttPacket::V5(v5::Packet::SubscribeAck(_)), _))) => {}
+            Some(Ok((other, _))) => {
+                log::warn!("re-SUBSCRIBE answered with {other:?}, continuing anyway");
+            }
+            Some(Err(e)) => return Err(invalid_data(e)),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "broker closed during re-SUBSCRIBE",
+                ));
+            }
+        }
+    }
+
+    // Deliver complete packets the dead broker connection had buffered; a
+    // trailing partial frame can never complete and is dropped (QoS0 only —
+    // QoS1/2 is healed by window retransmits / broker redelivery).
+    {
+        let mut codec = codec_for(hs.version);
+        loop {
+            match codec.decode(broker_leftover) {
+                Ok(Some((packet, _))) => client.send(packet).await.map_err(invalid_data)?,
+                Ok(None) => break,
+                Err(e) => {
+                    log::warn!("dropping undecodable broker leftover: {e}");
+                    break;
+                }
+            }
+        }
+        if !broker_leftover.is_empty() {
+            log::warn!("dropping {} partial broker byte(s)", broker_leftover.len());
+            broker_leftover.clear();
+        }
+    }
+
+    // Retransmit QoS in-flight packets that never completed end-to-end, then
+    // flush outage-buffered publishes in arrival order.
+    {
+        use tokio::io::AsyncWriteExt;
+        for raw in windows.broker_retransmits() {
+            broker.get_mut().write_all(&raw).await?;
+        }
+        for raw in windows.client_retransmits() {
+            client.get_mut().write_all(&raw).await?;
+        }
+        if !buffer.entries.is_empty() {
+            log::info!("flushing {} outage-buffered publish(es)", buffer.entries.len());
+        }
+        for entry in buffer.entries.drain(..) {
+            match entry.qos {
+                1 => {
+                    local_acks.qos1.insert(entry.packet_id);
+                }
+                2 => {
+                    local_acks.qos2.insert(entry.packet_id);
+                }
+                other => unreachable!("QoS{other} is never buffered"),
+            }
+            broker.get_mut().write_all(&entry.raw).await?;
+        }
+        buffer.bytes = 0;
+        broker.get_mut().flush().await?;
+        client.get_mut().flush().await?;
+    }
+    Ok(())
+}
+
+/// Outcome of servicing a freeze request.
+#[allow(clippy::large_enum_variant)]
+enum FreezeOutcome {
+    Resume(MqttFramed, Option<MqttFramed>),
+    Exit,
+}
+
+/// Freeze at a packet boundary: snapshot everything (broker side optional —
+/// it may be down), reply to the coordinator, then either restore on
+/// rollback or report exit after a successful handoff.
+#[allow(clippy::too_many_arguments)]
+async fn handle_freeze(
+    req: crate::registry::FreezeRequest,
+    id: u64,
+    client: MqttFramed,
+    broker: Option<MqttFramed>,
+    hs: &Handshake,
+    windows: &InflightWindows,
+    subscriptions: &Subscriptions,
+    buffer: &OutageBuffer,
+) -> FreezeOutcome {
+    let mut cp = client.into_parts();
+    let mut bp = broker.map(Framed::into_parts);
+    let snapshot = SessionSnapshot {
+        version: hs.version_byte(),
+        connect_raw: hs.connect_raw.clone(),
+        client_buf: cp.read_buf.split().to_vec(),
+        broker_buf: bp
+            .as_mut()
+            .map(|p| p.read_buf.split().to_vec())
+            .unwrap_or_default(),
+        windows: windows.snapshot(),
+        subscriptions: subscriptions.0.clone(),
+        buffered: buffer.entries.clone(),
+    };
+    let frozen = FrozenSession {
+        id,
+        snapshot,
+        client_fd: cp.io.as_raw_fd(),
+    };
+    log::debug!(
+        "session {id} frozen with {} window entr(ies), {} buffered",
+        frozen.snapshot.windows.len(),
+        frozen.snapshot.buffered.len()
+    );
+
+    let returned = match req.reply.send(frozen) {
+        Err(returned) => returned, // coordinator gave up: restore below
+        Ok(()) => match req.resume.await {
+            Ok(ResumeAction::Resume(returned)) => *returned,
+            Err(_) => return FreezeOutcome::Exit, // handoff done; exiting
+        },
+    };
+    let frozen = returned;
+    cp.read_buf.extend_from_slice(&frozen.snapshot.client_buf);
+    if let Some(bp) = bp.as_mut() {
+        bp.read_buf.extend_from_slice(&frozen.snapshot.broker_buf);
+    }
+    FreezeOutcome::Resume(
+        Framed::from_parts(cp),
+        bp.map(Framed::from_parts),
+    )
 }
 
 /// Clear the clean_session (v3) / clean_start (v5) bit — bit 1 of the CONNECT
@@ -306,98 +700,211 @@ pub async fn run_session(
     forward_loop(
         id,
         client,
-        broker,
+        Some(broker),
+        broker_addr,
         hs,
         control,
         InflightWindows::new(),
         Subscriptions::default(),
+        LocalAcks::default(),
+        OutageBuffer::default(),
+        BytesMut::new(),
     )
     .await
 }
 
+/// What the outage phase waits on next: a connect attempt, or a backoff
+/// sleep after a failed one.
+enum OutageStep {
+    Connect,
+    Backoff(std::time::Duration),
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn forward_loop(
     id: u64,
     mut client: MqttFramed,
-    mut broker: MqttFramed,
+    mut broker: Option<MqttFramed>,
+    broker_addr: SocketAddr,
     hs: Handshake,
     mut control: mpsc::Receiver<SessionControl>,
     mut windows: InflightWindows,
     mut subscriptions: Subscriptions,
+    mut local_acks: LocalAcks,
+    mut buffer: OutageBuffer,
+    mut broker_leftover: BytesMut,
 ) -> io::Result<()> {
+    let mut backoff = BROKER_RETRY_INITIAL;
+    let mut step = OutageStep::Connect;
     loop {
-        tokio::select! {
-            next = client.next() => match next {
-                Some(Ok((p, _))) => {
-                    windows.track_c2b(&p);
-                    subscriptions.track(&p);
-                    broker.send(p).await.map_err(invalid_data)?;
-                }
-                Some(Err(e)) => return Err(invalid_data(e)),
-                None => return Ok(()),
-            },
-            next = broker.next() => match next {
-                Some(Ok((p, _))) => {
-                    windows.track_b2c(&p);
-                    client.send(p).await.map_err(invalid_data)?;
-                }
-                Some(Err(e)) => return Err(invalid_data(e)),
-                None => return Ok(()),
-            },
-            req = control.recv() => match req {
-                Some(SessionControl::Freeze(req)) => {
-                    let mut cp = client.into_parts();
-                    let mut bp = broker.into_parts();
-                    let snapshot = SessionSnapshot {
-                        version: hs.version_byte(),
-                        connect_raw: hs.connect_raw.clone(),
-                        client_buf: cp.read_buf.split().to_vec(),
-                        broker_buf: bp.read_buf.split().to_vec(),
-                        windows: windows.snapshot(),
-                        subscriptions: subscriptions.0.clone(),
-                    };
-                    let mut frozen = FrozenSession {
-                        id,
-                        snapshot,
-                        client_fd: cp.io.as_raw_fd(),
-                    };
-                    log::debug!(
-                        "session {id} frozen with {} in-flight window entr(ies)",
-                        frozen.snapshot.windows.len()
-                    );
-                    if let Err(returned) = req.reply.send(frozen) {
-                        // Coordinator gave up on us: restore and carry on.
-                        frozen = returned;
-                        cp.read_buf.extend_from_slice(&frozen.snapshot.client_buf);
-                        bp.read_buf.extend_from_slice(&frozen.snapshot.broker_buf);
-                        client = Framed::from_parts(cp);
-                        broker = Framed::from_parts(bp);
-                        continue;
-                    }
-                    match req.resume.await {
-                        Ok(ResumeAction::Resume(frozen)) => {
-                            // Rollback: restore buffers and continue. The
-                            // windows never left this task, so just keep them.
-                            cp.read_buf.extend_from_slice(&frozen.snapshot.client_buf);
-                            bp.read_buf.extend_from_slice(&frozen.snapshot.broker_buf);
-                            client = Framed::from_parts(cp);
-                            broker = Framed::from_parts(bp);
+        if broker.is_some() {
+            // ---- connected phase ----
+            let mut b = broker.take().expect("checked above");
+            tokio::select! {
+                next = client.next() => match next {
+                    Some(Ok((p, _))) => {
+                        windows.track_c2b(&p);
+                        subscriptions.track(&p);
+                        if let Err(e) = b.send(p).await {
+                            log::warn!("broker write failed ({e}), entering outage mode");
+                            broker = None;
+                            continue;
                         }
-                        Err(_) => return Ok(()), // handoff done; process is exiting
+                        broker = Some(b);
                     }
-                }
-                None => return Ok(()), // registry gone: process is shutting down
-            },
+                    Some(Err(e)) => return Err(invalid_data(e)),
+                    None => return Ok(()),
+                },
+                next = b.next() => match next {
+                    Some(Ok((p, _))) => {
+                        broker = Some(b);
+                        // Broker acks for outage-buffered publishes belong
+                        // to the proxy; the client was already acked locally.
+                        match &p {
+                            MqttPacket::V3(v3::Packet::PublishAck { packet_id })
+                                if local_acks.qos1.remove(&packet_id.get()) => {}
+                            MqttPacket::V3(v3::Packet::PublishReceived { packet_id })
+                                if local_acks.qos2.contains(&packet_id.get()) =>
+                            {
+                                broker
+                                    .as_mut()
+                                    .unwrap()
+                                    .send(MqttPacket::V3(v3::Packet::PublishRelease {
+                                        packet_id: *packet_id,
+                                    }))
+                                    .await
+                                    .map_err(invalid_data)?;
+                            }
+                            MqttPacket::V3(v3::Packet::PublishComplete { packet_id })
+                                if local_acks.qos2.remove(&packet_id.get()) => {}
+                            MqttPacket::V5(v5::Packet::PublishAck(ack))
+                                if local_acks.qos1.remove(&ack.packet_id.get()) => {}
+                            MqttPacket::V5(v5::Packet::PublishReceived(ack))
+                                if local_acks.qos2.contains(&ack.packet_id.get()) =>
+                            {
+                                broker
+                                    .as_mut()
+                                    .unwrap()
+                                    .send(MqttPacket::V5(v5::Packet::PublishRelease(
+                                        v5::PublishAck2 {
+                                            packet_id: ack.packet_id,
+                                            reason_code: v5::PublishAck2Reason::Success,
+                                            properties: Vec::new(),
+                                            reason_string: None,
+                                        },
+                                    )))
+                                    .await
+                                    .map_err(invalid_data)?;
+                            }
+                            MqttPacket::V5(v5::Packet::PublishComplete(ack))
+                                if local_acks.qos2.remove(&ack.packet_id.get()) => {}
+                            _ => {
+                                windows.track_b2c(&p);
+                                client.send(p).await.map_err(invalid_data)?;
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        log::warn!("broker read failed ({e}), entering outage mode");
+                        broker_leftover = b.into_parts().read_buf;
+                        broker = None;
+                    }
+                    None => {
+                        log::warn!("broker closed the connection, entering outage mode");
+                        broker_leftover = b.into_parts().read_buf;
+                        broker = None;
+                    }
+                },
+                req = control.recv() => match req {
+                    Some(SessionControl::Freeze(req)) => {
+                        match handle_freeze(
+                            req, id, client, Some(b), &hs, &windows, &subscriptions, &buffer,
+                        )
+                        .await
+                        {
+                            FreezeOutcome::Resume(c, b) => {
+                                client = c;
+                                broker = b;
+                            }
+                            FreezeOutcome::Exit => return Ok(()),
+                        }
+                    }
+                    None => return Ok(()),
+                },
+            }
+        } else {
+            // ---- outage phase: retry the broker while servicing the client ----
+            let wait: std::pin::Pin<Box<dyn std::future::Future<Output = Option<TcpStream>> + Send>> =
+                match step {
+                    OutageStep::Connect => Box::pin(async move { TcpStream::connect(broker_addr).await.ok() }),
+                    OutageStep::Backoff(d) => Box::pin(async move {
+                        tokio::time::sleep(d).await;
+                        None
+                    }),
+                };
+            tokio::select! {
+                next = client.next() => match next {
+                    Some(Ok((p, _))) => {
+                        service_outage_packet(&mut client, p, &mut buffer, &mut subscriptions).await?;
+                    }
+                    Some(Err(e)) => return Err(invalid_data(e)),
+                    None => return Ok(()),
+                },
+                req = control.recv() => match req {
+                    Some(SessionControl::Freeze(req)) => {
+                        match handle_freeze(
+                            req, id, client, None, &hs, &windows, &subscriptions, &buffer,
+                        )
+                        .await
+                        {
+                            FreezeOutcome::Resume(c, b) => {
+                                client = c;
+                                broker = b;
+                            }
+                            FreezeOutcome::Exit => return Ok(()),
+                        }
+                    }
+                    None => return Ok(()),
+                },
+                result = wait => match result {
+                    Some(stream) => {
+                        log::info!("broker connection (re)established");
+                        let mut b = Framed::new(stream, codec_for(hs.version));
+                        establish_broker(
+                            &mut b,
+                            &hs,
+                            &mut client,
+                            &subscriptions,
+                            &windows,
+                            &mut local_acks,
+                            &mut buffer,
+                            &mut broker_leftover,
+                        )
+                        .await?;
+                        broker = Some(b);
+                        backoff = BROKER_RETRY_INITIAL;
+                        step = OutageStep::Connect;
+                    }
+                    None => match step {
+                        OutageStep::Connect => {
+                            log::warn!("broker connect failed, retrying in {backoff:?}");
+                            step = OutageStep::Backoff(backoff);
+                            backoff = (backoff * 2).min(BROKER_RETRY_MAX);
+                        }
+                        OutageStep::Backoff(_) => {
+                            step = OutageStep::Connect;
+                        }
+                    },
+                },
+            }
         }
     }
 }
 
 /// Adopt a migrated session (child side of a shed): take ownership of the
-/// client socket FD, re-establish the broker-side connection by replaying the
-/// original CONNECT, deliver any buffered broker bytes to the client, then
-/// resume normal forwarding.
-///
-/// TODO(next milestone): force clean_start/clean_session=false on the
-/// replayed CONNECT and restore subscription/QoS state.
+/// client socket FD and resume the session from the snapshot. The broker
+/// side is established by the forward loop itself (with outage tolerance),
+/// so a shed during a broker outage works too.
 pub async fn adopt_session(
     client_fd: RawFd,
     snapshot: SessionSnapshot,
@@ -406,107 +913,39 @@ pub async fn adopt_session(
 ) -> io::Result<()> {
     let hs = Handshake::from_snapshot_version(snapshot.version, snapshot.connect_raw.clone())?;
 
-    // The broker must see a session *resumption*, not a fresh start: clear
-    // the clean bit in the replayed CONNECT. (v5 note: full resumption also
-    // requires the client's session_expiry > 0; the re-SUBSCRIBE below
-    // restores routing regardless.)
-    let mut connect_raw = snapshot.connect_raw.clone();
-    force_session_resumption(&mut connect_raw)?;
-
-    // Adopt the client socket.
+    // Adopt the client socket, seeding undelivered client bytes.
     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(client_fd) };
     std_stream.set_nonblocking(true)?;
     let client_stream = TcpStream::from_std(std_stream)?;
     let mut parts = FramedParts::new(client_stream, codec_for(hs.version));
     parts.read_buf.extend_from_slice(&snapshot.client_buf);
-    let mut client = Framed::from_parts(parts);
+    let client = Framed::from_parts(parts);
 
-    // Re-establish the broker side; the CONNACK stays proxy-local since the
-    // client never disconnected.
-    let broker = TcpStream::connect(broker_addr).await?;
-    let mut broker = Framed::new(broker, codec_for(hs.version));
-    {
-        use tokio::io::AsyncWriteExt;
-        broker.get_mut().write_all(&connect_raw).await?;
-        broker.get_mut().flush().await?;
-    }
-    match broker.next().await {
-        Some(Ok((MqttPacket::V3(v3::Packet::ConnectAck(_)), _)))
-        | Some(Ok((MqttPacket::V5(v5::Packet::ConnectAck(_)), _))) => {}
-        Some(Ok((other, _))) => {
-            return Err(invalid_data(format!("broker answered CONNECT replay with {other:?}")));
-        }
-        Some(Err(e)) => return Err(invalid_data(e)),
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "broker closed during CONNECT replay",
-            ));
-        }
-    }
-
-    // Re-SUBSCRIBE so routing survives even when the broker dropped session
-    // state; proxy-internal, so the SUBACK is not forwarded to the client.
-    let subscriptions = Subscriptions(snapshot.subscriptions);
-    if let Some(packet) = subscriptions.resubscribe_packet(hs.version) {
-        broker.send(packet).await.map_err(invalid_data)?;
-        match broker.next().await {
-            Some(Ok((MqttPacket::V3(v3::Packet::SubscribeAck { .. }), _)))
-            | Some(Ok((MqttPacket::V5(v5::Packet::SubscribeAck(_)), _))) => {}
-            Some(Ok((other, _))) => {
-                log::warn!("re-SUBSCRIBE answered with {other:?}, continuing anyway");
-            }
-            Some(Err(e)) => return Err(invalid_data(e)),
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "broker closed during re-SUBSCRIBE",
-                ));
-            }
-        }
-    }
-
-    // Deliver packets the old broker connection had buffered but not yet
-    // forwarded; a trailing partial frame is dropped (QoS0 only — QoS1/2
-    // arrives via broker redelivery once session resumption lands).
-    let mut leftover = BytesMut::from(&snapshot.broker_buf[..]);
-    let mut codec = codec_for(hs.version);
-    loop {
-        match codec.decode(&mut leftover) {
-            Ok(Some((packet, _))) => client.send(packet).await.map_err(invalid_data)?,
-            Ok(None) => break,
-            Err(e) => {
-                log::warn!("dropping undecodable broker buffer on thaw: {e}");
-                break;
-            }
-        }
-    }
-    if !leftover.is_empty() {
-        log::warn!("dropping {} partial broker bytes on thaw", leftover.len());
-    }
-
-    // Retransmit QoS in-flight packets that never completed end-to-end.
     let windows = InflightWindows::from_snapshot(snapshot.windows);
-    log::info!(
-        "thaw: retransmitting {} packet(s) toward broker, {} toward client",
-        windows.broker_retransmits().len(),
-        windows.client_retransmits().len()
-    );
-    {
-        use tokio::io::AsyncWriteExt;
-        for raw in windows.broker_retransmits() {
-            broker.get_mut().write_all(&raw).await?;
-        }
-        for raw in windows.client_retransmits() {
-            client.get_mut().write_all(&raw).await?;
-        }
-        broker.get_mut().flush().await?;
-        client.get_mut().flush().await?;
-    }
+    let subscriptions = Subscriptions(snapshot.subscriptions);
+    let bytes = snapshot.buffered.iter().map(|p| p.raw.len()).sum();
+    let buffer = OutageBuffer {
+        entries: snapshot.buffered,
+        bytes,
+    };
+    let broker_leftover = BytesMut::from(&snapshot.broker_buf[..]);
 
     // Register so the adopted session is migratable on the next shed.
     let (id, control) = registry.register();
     let _registration = Registration { registry, id };
 
-    forward_loop(id, client, broker, hs, control, windows, subscriptions).await
+    forward_loop(
+        id,
+        client,
+        None,
+        broker_addr,
+        hs,
+        control,
+        windows,
+        subscriptions,
+        LocalAcks::default(),
+        buffer,
+        broker_leftover,
+    )
+    .await
 }

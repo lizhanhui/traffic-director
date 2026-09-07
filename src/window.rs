@@ -71,7 +71,7 @@ fn vec_contains(v: &[(u16, (WindowState, Vec<u8>))], id: u16) -> bool {
     v.iter().any(|(k, _)| *k == id)
 }
 
-fn encode_raw(packet: &MqttPacket) -> Vec<u8> {
+pub(crate) fn encode_raw(packet: &MqttPacket) -> Vec<u8> {
     let mut buf = BytesMut::new();
     match packet {
         MqttPacket::V3(p) => {

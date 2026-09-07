@@ -31,6 +31,16 @@ pub struct SubscriptionEntry {
     pub options: u8,
 }
 
+/// A publish the proxy acked locally during a broker outage, still owed to
+/// the broker after reconnect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferedPublish {
+    pub packet_id: u16,
+    pub raw: Vec<u8>,
+    /// QoS as u8 (1 or 2; QoS0 is never buffered).
+    pub qos: u8,
+}
+
 /// Serializable per-session state at a packet boundary.
 /// `version` is the MQTT protocol level (4 = v3.1.1, 5 = v5.0).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +57,8 @@ pub struct SessionSnapshot {
     pub windows: Vec<WindowEntry>,
     /// Active subscriptions, re-issued toward the broker on thaw.
     pub subscriptions: Vec<SubscriptionEntry>,
+    /// Locally-acked publishes from a broker outage, flushed on reconnect.
+    pub buffered: Vec<BufferedPublish>,
 }
 
 pub enum SessionControl {
@@ -111,11 +123,13 @@ impl SessionRegistry {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel(1);
         self.sessions.lock().unwrap().insert(id, tx);
+        log::debug!("session {id} registered");
         (id, rx)
     }
 
     pub fn unregister(&self, id: u64) {
         self.sessions.lock().unwrap().remove(&id);
+        log::debug!("session {id} unregistered");
     }
 
     pub fn count(&self) -> usize {
