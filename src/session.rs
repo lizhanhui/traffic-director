@@ -381,7 +381,12 @@ async fn establish_broker(
     broker_leftover: &mut BytesMut,
 ) -> io::Result<()> {
     // CONNECT replay with forced session resumption; CONNACK stays
-    // proxy-local since the client never disconnected.
+    // proxy-local since the client never disconnected. Note: the clean bit
+    // is the only thing we rewrite — the proxy deliberately does NOT patch
+    // v5 session_expiry (see design doc, "v5 session expiry: explicit
+    // non-goal"), so a client asking for expiry=0 forfeits broker-queued
+    // offline messages on broker restart; routing is restored via
+    // re-SUBSCRIBE regardless.
     let mut connect_raw = hs.connect_raw.clone();
     force_session_resumption(&mut connect_raw)?;
     {

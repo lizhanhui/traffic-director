@@ -130,6 +130,34 @@ reloaded.
   on expiry the parent exits and remaining clients reconnect to the new
   generation via normal MQTT reconnect logic. Documented trade-off of drain
   mode.
+- **Broker-initiated administrative DISCONNECT (v5):** intercepted
+  (`NormalDisconnection`, `ServerShuttingDown`, `ServerBusy`,
+  `UseAnotherServer`, `ServerMoved`) and treated as a transport loss — the
+  session enters the outage path instead of telling the client. Client-fault
+  reason codes are forwarded and end the session.
+
+### v5 session expiry: explicit non-goal
+
+When a v5 client connects with `session_expiry_interval = 0`, the broker
+discards the session at transport loss, so a broker-node restart (or a
+failover to another node) loses that session's queued offline QoS1/2
+messages. **The proxy deliberately does not rewrite `session_expiry`**
+(decision 2026-09-07): overriding a client's declared session semantics
+would change what the client asked for and leak session state on brokers
+for sessions that were meant to be transient.
+
+Consequences and where the responsibility lies:
+
+- What the proxy guarantees with `expiry = 0`: the client's connection and
+  in-flight QoS windows survive proxy/broker restarts, subscriptions are
+  restored via re-SUBSCRIBE, and publishes during a broker outage are
+  locally acked and buffered by the proxy itself.
+- What it cannot guarantee: messages the *broker* had queued for the client
+  (offline messages). Preserving those requires broker-side session
+  retention — e.g. mosquitto `persistence true`, or a cluster with shared
+  session state (EMQX et al.) — plus clients connecting with a non-zero
+  `session_expiry_interval`. That is a broker/cluster and client
+  configuration concern, not a proxy one.
 
 ## 5. Testing & verification
 
