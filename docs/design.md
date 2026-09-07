@@ -77,9 +77,124 @@ client ──MQTT──▶ traffic-director ──MQTT──▶ broker
   - **migrate** — parent freezes every session at a packet boundary, ships
     snapshots (CONNECT bytes, codec buffers, QoS windows, subscriptions,
     outage buffer) plus client socket FDs over an inherited Unix datagram
-    pair (JSON + SCM_RIGHTS, acked per session), and exits immediately. The
-    child adopts the sockets and resumes sessions; clients observe only a
-    brief stall.
+  pair (JSON + SCM_RIGHTS, acked per session), and exits immediately. The
+  child adopts the sockets and resumes sessions; clients observe only a
+  brief stall.
+
+## Technical details
+
+### How ecdysis achieves a zero-gap process upgrade
+
+The mechanism (inherited from Cloudflare's `tableflip`, and described in
+their [ecdysis blog
+post](https://blog.cloudflare.com/ecdysis-rust-graceful-restarts/)) solves
+the hardest part of self-restart: handing the listen socket to a new
+process without ever refusing a connection. ecdysis was built around four
+goals: old code shuts down completely after upgrade; the new process gets
+a grace period for initialization; a child crashing during initialization
+is acceptable and must not affect the service; and only one upgrade runs
+at a time.
+
+1. **Socket registration.** At boot, every listener is created through
+   ecdysis and recorded in a registry (fd + address). On first boot the
+   socket is bound fresh; on every later generation it is *inherited*
+   instead.
+2. **Fork, then exec.** On `SIGUSR2` the parent `fork()`s and the child
+   immediately `execve()`s the new binary — a clean address space with no
+   inherited memory; only explicitly passed file descriptors cross the
+   boundary (everything else stays `CLOEXEC`). The serialized socket
+   registry and the listen FDs travel over a pipe shared with the parent
+   (`SCM_RIGHTS`).
+3. **Ready handshake.** The child boots, detects the inherited
+   environment, and reclaims the same underlying socket — because both
+   processes temporarily reference one kernel data structure, the accept
+   queue never went away. The parent keeps accepting while the child
+   initializes (there is even an intentional brief window where *both*
+   accept concurrently; connections the parent picks up in that window are
+   simply drained like any other). Once the child signals readiness over
+   the pipe, the parent closes its copy of the listen socket and continues
+   with existing connections only. No SYN is ever refused.
+4. **Failure safety.** If the child crashes before signalling ready, the
+   parent's `upgrade()` simply returns an error: the parent never stopped
+   accepting and continues as the sole generation, and the upgrade can be
+   retried. A crashed upgrade attempt is therefore indistinguishable from
+   no upgrade at all. (Note for sandboxes: this model requires `fork()`
+   and `execve()` to be permitted, e.g. under seccomp.)
+
+What ecdysis deliberately does *not* provide is state transfer for
+established connections — that is application territory, and where the two
+shed modes diverge:
+
+- **Drain mode** needs nothing more: the parent keeps its existing sessions
+  running in old code until they end, then exits. Simple and robust; the
+  cost is that old code lingers until the last long-lived MQTT connection
+  closes (bounded by a drain timeout).
+- **Migrate mode** adds our own state channel on top: the parent freezes
+  each session at a packet boundary and serializes a snapshot (re-encoded
+  CONNECT, codec buffer leftovers, QoS in-flight windows, subscription
+  table, outage buffer) as one JSON datagram per session over an
+  ecdysis-inherited Unix datagram pair — with the client socket fd attached
+  to each datagram via `SCM_RIGHTS`, which dups the fd into the child's
+  descriptor table while referring to the *same kernel socket*. The client
+  4-tuple is preserved, so the client's TCP stack sees nothing but a pause.
+  Ordering is important: snapshots are written and fds are marked
+  inheritable *before* the child is spawned, and the parent waits for the
+  child's ready signal before pushing the datagrams — so a parent crash
+  either happens before the spawn (nothing was shed) or after the child is
+  fully equipped (the parent is redundant). Each datagram is acknowledged
+  before the next is sent, so a partial handoff is detectable and degrades
+  to draining the un-sent remainder instead of losing sessions.
+
+### How retry-with-backoff hides broker maintenance
+
+The client connection and the broker connection are independent; the
+session's job is to keep the client side healthy while the broker side is
+rebuilt. The forward loop is a two-phase state machine:
+
+**Connected phase.** Packets flow both ways with per-direction QoS
+bookkeeping. Three events move the session to the outage phase: broker
+transport error/close (the only signal v3 brokers give), a broker write
+failure, or an intercepted v5 administrative DISCONNECT (rolling update).
+The old connection's undecoded bytes are captured as a "leftover" so
+nothing already received is dropped.
+
+**Outage phase.** The client must not notice anything, so the proxy
+becomes a temporary stand-in for the broker:
+
+- **Keepalives are answered locally** (PINGREQ → PINGRESP) — otherwise the
+  client would time out and disconnect itself.
+- **QoS1/2 publishes are acked locally and buffered** (bounded at 1 MiB,
+  then the session closes rather than endangering the process). QoS0 is
+  dropped, which at-most-once semantics permit.
+- **SUBSCRIBE/UNSUBSCRIBE are acked locally and recorded** in the
+  subscription table.
+- Meanwhile the proxy retries the broker with exponential backoff:
+  100 ms initial, doubling, capped at 5 s, indefinitely. The client socket
+  is serviced throughout — including freeze requests, so a proxy upgrade
+  can happen *during* a broker outage and carries the buffer along in the
+  snapshot.
+
+**Replay on reconnect** is what makes the recovery exact rather than
+"close enough":
+
+1. CONNECT is replayed with the clean bit **cleared** — the broker treats
+   it as session resumption and redelivers whatever its session store
+   still holds.
+2. The recorded subscriptions are re-issued (idempotent), restoring
+   routing even when the broker dropped everything.
+3. The dead connection's leftover bytes are decoded and delivered
+   downstream.
+4. QoS in-flight windows are retransmitted: unacked client→broker
+   publishes go out with DUP=1 (or PUBREL for mid-handshake QoS2);
+   unacked broker→client publishes are replayed downstream the same way.
+5. The outage buffer is flushed in arrival order. Because the client was
+   already acked locally, the broker's acks for these packet ids are eaten
+   by the proxy instead of being forwarded — the client sees each message
+   acknowledged exactly once.
+
+The client-visible result of a broker rolling update is a brief pause in
+broker-originated traffic; no DISCONNECT, no reconnect, no subscription
+loss, and no message loss beyond what QoS0 permits.
 
 ## Features (implemented and tested)
 
