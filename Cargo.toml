@@ -1,0 +1,10 @@
+[package]
+name = "traffic-director"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ecdysis = "1.1.1"
+foundations = "5.10.1"
+rmqtt-codec = "0.3.0"
+tokio = { version = "1.53.1", features = ["full"] }
