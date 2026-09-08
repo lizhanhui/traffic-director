@@ -298,6 +298,17 @@ the same code path and signal handling.
   `argv[0]` with identical arguments, so `--listen`, `--broker`, `--mode`
   carry over automatically.
 
+**Containers: PID 1 must understand the shed model.** A generational
+upgrade *requires* the old process to exit — so a generic init that exits
+when its direct child exits (tini, dumb-init) tears the container down on
+the first shed, grandchild included. The repo therefore ships `td-init`
+(and a `Dockerfile` using it): it forwards `SIGUSR2`/`SIGTERM`/`SIGINT` to
+the process group, sets `PR_SET_CHILD_SUBREAPER` so orphaned generations
+reparent to it, reaps them, and exits with the final status only when no
+descendant remains. Ops flow: push a new image, `docker kill -s USR2
+<container>` to shed, `docker stop` to retire. Healthchecks can simply
+TCP-connect the listen port — it never stops accepting, even mid-shed.
+
 **Broker configuration.**
 
 - For offline-message retention across broker restarts, enable persistence
